@@ -1,0 +1,14 @@
+refinement {
+  pdb_interpretation {
+    c_beta_restraints = True
+    chir_volume_esd = 0.1
+  }
+  refine {
+    strategy = *individual_sites individual_sites_real_space rigid_body \
+               *individual_adp group_adp tls occupancies group_anomalous den
+    occupancies { remove_selection = All }
+  }
+  geometry_restraints.edits {
+    excessive_bond_distance_limit = 100
+  }
+}
