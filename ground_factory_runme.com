@@ -14,13 +14,16 @@
 #     ground_factory_runme.com model.pdb data.mtz [options]
 #
 #   Options:
-#     maxcycles=N      max iterations (default 300)
-#     maxadd=N         new restraints per type per cycle (default 1)
-#     wxc=0.1          X-ray coordinate weight scale
-#     wxu=0.05         X-ray ADP weight scale
-#     overrides=file   TORSION OVERRIDE file for genuine outliers
-#     prefix=start     phenix output prefix
-#     srun=1           submit phenix jobs via "srun -p debug" (default 1)
+#     maxcycles=N        max iterations (default 300)
+#     maxadd=N           new restraints per type per cycle (default 1)
+#     wxc=0.1            X-ray coordinate weight scale
+#     wxu=0.05           X-ray ADP weight scale
+#     overrides=file     TORSION OVERRIDE file for genuine outliers
+#     prefix=start       phenix output prefix
+#     srun=1             submit phenix jobs via "srun -p debug" (default 1)
+#     propagate=0        if 1, each iteration starts from previous output (default 0)
+#     snap_interval=0    if >0, run a snap iteration every N cycles (default 0=off)
+#     snap_wxc=1.0       wxc_scale used during snap iterations (default 1.0)
 #
 #   Outputs:
 #     start_NNN.pdb    phenix-refined model each iteration
@@ -30,28 +33,34 @@
 #     simplenoise.mtz  ~3% noise added
 #     itr_vs_energy.txt  energy per iteration
 
-set pdbfile   = ""
-set mtzfile   = ""
-set maxcycles = 300
-set maxadd    = 1
-set wxc       = 0.1
-set wxu       = 0.05
-set overrides = ""
-set prefix    = start
-set srun      = 1
+set pdbfile       = ""
+set mtzfile       = ""
+set maxcycles     = 300
+set maxadd        = 1
+set wxc           = 0.1
+set wxu           = 0.05
+set overrides     = ""
+set prefix        = start
+set srun          = 1
+set propagate     = 0
+set snap_interval = 0
+set snap_wxc      = 1.0
 
 foreach Arg ( $* )
   set key = `echo $Arg | awk -F= '{print $1}'`
   set val = `echo $Arg | awk -F= '{print $2}'`
   if("$Arg" =~ *.pdb) set pdbfile = $Arg
   if("$Arg" =~ *.mtz) set mtzfile = $Arg
-  if("$key" == "maxcycles") set maxcycles = $val
-  if("$key" == "maxadd")    set maxadd    = $val
-  if("$key" == "wxc")       set wxc       = $val
-  if("$key" == "wxu")       set wxu       = $val
-  if("$key" == "overrides") set overrides = $val
-  if("$key" == "prefix")    set prefix    = $val
-  if("$key" == "srun")      set srun      = $val
+  if("$key" == "maxcycles")     set maxcycles     = $val
+  if("$key" == "maxadd")        set maxadd        = $val
+  if("$key" == "wxc")           set wxc           = $val
+  if("$key" == "wxu")           set wxu           = $val
+  if("$key" == "overrides")     set overrides     = $val
+  if("$key" == "prefix")        set prefix        = $val
+  if("$key" == "srun")          set srun          = $val
+  if("$key" == "propagate")     set propagate     = $val
+  if("$key" == "snap_interval") set snap_interval = $val
+  if("$key" == "snap_wxc")      set snap_wxc      = $val
 end
 
 if("$pdbfile" == "" || "$mtzfile" == "") then
@@ -142,6 +151,13 @@ endif
 set num = `ls -1rt ${prefix}_???.pdb | tail -n 1 | awk -F_ '{print substr($NF,1,3)+0}'`
 if("$num" == "") set num = 0
 
+# For forward propagation, resume from the last completed iteration's output
+set startpdb = $pdbfile
+if($propagate) then
+  set _last = `ls -1rt ${prefix}_???.pdb 2>/dev/null | tail -1`
+  if("$_last" != "") set startpdb = $_last
+endif
+
 echo "=== Starting iterative loop from iteration $num ==="
 if($num == 0) echo "" >! itr_vs_energy.txt
 
@@ -149,13 +165,21 @@ foreach x ( `seq 1 $maxcycles` )
 
   set num = `echo $num | awk '{printf("%03d",$1+1)}'`
 
+  # Determine wxc for this iteration (snap if interval is set and num is a multiple)
+  set wxc_now = $wxc
+  set is_snap = `echo $num $snap_interval | awk '{print ($2>0 && $1%$2==0)}'`
+  if($is_snap) then
+    set wxc_now = $snap_wxc
+    echo "=== SNAP iteration $num : wxc_scale=$snap_wxc ==="
+  endif
+
   # Skip if this iteration's output already exists
   if(-e ${prefix}_${num}.pdb) goto already_done
 
-  $PHENIXRUN $pdbfile $mtzfile \
+  $PHENIXRUN $startpdb $mtzfile \
     prefix=${prefix} serial=${num} \
     $ssargs noocc.eff \
-    wxc_scale=${wxc} wxu_scale=${wxu} \
+    wxc_scale=${wxc_now} wxu_scale=${wxu} \
     main.number_of_macro_cycles=5 \
     write_geo_file=True \
     phenix_holdme.eff phenix_fudge.eff >! phenix_${num}.log
@@ -173,19 +197,26 @@ foreach x ( `seq 1 $maxcycles` )
 
   already_done:
 
+  # Propagate: next iteration starts from this iteration's output
+  if($propagate) set startpdb = ${prefix}_${num}.pdb
+
   ${scriptdir}/molprobify_runme.com ${prefix}_${num}.pdb keepgeo=1 writefudge=1 debug=1 \
     tempfile=/dev/shm/${USER}/gf_${num}_ \
     $overridearg | tee molprobify_${num}.log
 
   # Extract energy and log it
   set energy = `grep "weighted energy" molprobify_${num}.log | awk '{print $NF}'`
-  echo "$num $energy" >> itr_vs_energy.txt
+  if($is_snap) then
+    echo "$num $energy snap" >> itr_vs_energy.txt
+  else
+    echo "$num $energy" >> itr_vs_energy.txt
+  endif
   echo "Iteration $num : energy = $energy"
 
   mkdir -p this
   cp refmac_opts_de*.txt refmac_opts_fix*.txt this/
 
-  ${scriptdir}/redo_harmonics_runme.com startpdb=$pdbfile prefix=$prefix
+  ${scriptdir}/redo_harmonics_runme.com startpdb=$startpdb prefix=$prefix
   cp refmac_opts_new.txt refmac_opts.txt
 
   ${scriptdir}/reweight_opts_runme.com maxadd=$maxadd

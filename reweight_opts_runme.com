@@ -444,6 +444,7 @@ egrep "^extern tors" new_cbdev_tors.txt >> refmac_opts_new.txt
 
 cat phenix_opts_debump.txt phenix_opts_fixbonds.txt phenix_opts_fixangles.txt \
   phenix_opts_fixtorsion.txt phenix_opts_fixplanes.txt phenix_opts_fixCBdev.txt |\
+awk '{gsub(/ and altid _/,"");print}' |\
 awk 'BEGIN{print "  geometry_restraints.edits {"} {print} END{print "  }"}' |\
 awk 'BEGIN{print "refinement {"} {print} END{print "}"}' |\
 cat >! phenix_fudge.eff

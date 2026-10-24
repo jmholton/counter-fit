@@ -923,7 +923,7 @@ awk '/^select/{del[$3,$4,$5,$6,$7]=del[$8,$9,$10,$11,$12]=$2;next}\
    print "#extern dist first chain",c1,"resi",r1,"atom",a1,"altecode",f1,\
       "seco chain",c2,"resi",r2,"atom",a2,"altecode",f2,\
       "value",ideal,"sigma",sigma,"type 0"}' |\
-awk '{gsub("altecode _","");gsub("chain _","");print}' |\
+awk '{gsub("chain _","");print}' |\
 egrep "^extern|^#extern" >! refmac_opts_declash.txt
 
 
@@ -1039,7 +1039,7 @@ awk '/^select/{\
    };\
   }}' |\
 tee ${t}debump.txt |\
-awk '{gsub("altecode _","");gsub("chain _","");print}' |\
+awk '{gsub("chain _","");print}' |\
 egrep "^extern|^#extern" >! refmac_opts_debump.txt
 
 
@@ -1066,7 +1066,7 @@ awk -v s=$sigma_fudge '$2>s{print;\
       "seco chain",c2,"resi",r2,"atom",a2,"altecode",f2,\
       "value",ideal,"sigma",sigma,"type 0"}' |\
 tee ${t}fixbond.txt |\
-awk '{gsub("altecode _","");gsub("chain _","");print}' |\
+awk '{gsub("chain _","");print}' |\
 egrep "^extern" >! refmac_opts_fixbond.txt
 
 
@@ -1096,7 +1096,7 @@ awk -v s=$sigma_fudge '$2>s{print;\
       "next chain",c3,"resi",r3,"atom",a3,"altecode",f3,\
       "value",ideal,"sigma",sigma}' |\
 tee ${t}fixang.txt |\
-awk '{gsub("altecode _","");gsub("chain _","");print}' |\
+awk '{gsub("chain _","");print}' |\
 egrep "^extern" >! refmac_opts_fixang.txt
 
 
@@ -1125,7 +1125,7 @@ awk -v s=$sigma_fudge '$2>s{\
       "value",cnab,"sigma 2.5 period 0";\
 }' |\
 tee ${t}fixCBdev.txt |\
-awk '{gsub("altecode _","");gsub("chain _","");print}' |\
+awk '{gsub("chain _","");print}' |\
 egrep "^extern" >! refmac_opts_fixCBdev.txt
 
 
@@ -1160,7 +1160,7 @@ awk -v s=$sigma_fudge '$2>s{print;\
       "next chain",c4,"resi",r4,"atom",a4,"altecode",f4,\
       "value",ideal,"sigma",sigma,"period 0"}' |\
 tee ${t}fixtorsion.txt |\
-awk '{gsub("altecode _","");gsub("chain _","");print}' |\
+awk '{gsub("chain _","");print}' |\
 egrep "^extern" >! refmac_opts_fixtorsion.txt
 
 
@@ -1203,7 +1203,7 @@ awk '/^PLANE/ && NF>15{sigma=$3;\
      printf("next chain %s resi %s atom %s altecode %s ",c,r,a,f);}\
    print "sigma",sigma}' |\
 tee ${t}fixplanes.txt |\
-awk '{gsub("altecode _","");gsub("chain _","");gsub("plane next","plane first");print}' |\
+awk '{gsub("chain _","");gsub("plane next","plane first");print}' |\
 egrep "^extern" >! refmac_opts_fixplanes.txt
 
 
