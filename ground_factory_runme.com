@@ -45,6 +45,7 @@ set srun          = 1
 set propagate     = 0
 set snap_interval = 0
 set snap_wxc      = 1.0
+set fudgeify      = 0
 
 foreach Arg ( $* )
   set key = `echo $Arg | awk -F= '{print $1}'`
@@ -61,6 +62,7 @@ foreach Arg ( $* )
   if("$key" == "propagate")     set propagate     = $val
   if("$key" == "snap_interval") set snap_interval = $val
   if("$key" == "snap_wxc")      set snap_wxc      = $val
+  if("$key" == "fudgeify")      set fudgeify      = $val
 end
 
 if("$pdbfile" == "" || "$mtzfile" == "") then
@@ -89,9 +91,19 @@ if(-s ss_link.cif && -s ss_link.eff) set ssargs = "ss_link.cif ss_link.eff"
 # -----------------------------------------------------------------------
 if(! -e noocc.eff) then
 cat >! noocc.eff << EOF
+data_manager {
+  fmodel {
+    xray_data {
+      r_free_flags {
+        generate = True
+      }
+    }
+  }
+}
+
 refinement {
   pdb_interpretation {
-    c_beta_restraints = True
+    c_beta_restraints = False
     chir_volume_esd = 0.1
   }
   refine {
@@ -159,7 +171,14 @@ if($propagate) then
 endif
 
 echo "=== Starting iterative loop from iteration $num ==="
-if($num == 0) echo "" >! itr_vs_energy.txt
+if($num == 0) then
+  echo "" >! itr_vs_energy.txt
+endif
+
+# Snap revert tracking: prev_energy = last non-snap wE, pre_snap_startpdb = model before snap
+set prev_energy = `grep -v snap itr_vs_energy.txt 2>/dev/null | tail -1 | awk '{print $2+0}'`
+if("$prev_energy" == "0" || "$prev_energy" == "") set prev_energy = 9999
+set pre_snap_startpdb = $startpdb
 
 foreach x ( `seq 1 $maxcycles` )
 
@@ -200,16 +219,28 @@ foreach x ( `seq 1 $maxcycles` )
   # Propagate: next iteration starts from this iteration's output
   if($propagate) set startpdb = ${prefix}_${num}.pdb
 
-  ${scriptdir}/molprobify_runme.com ${prefix}_${num}.pdb keepgeo=1 writefudge=1 debug=1 \
-    tempfile=/dev/shm/${USER}/gf_${num}_ \
+  set moltempfile = /dev/shm/${USER}/gf_${num}_
+  set molwritefudge = writefudge=1
+  if($fudgeify) set molwritefudge = ""
+  ${scriptdir}/molprobify_runme.com ${prefix}_${num}.pdb keepgeo=1 $molwritefudge debug=1 \
+    tempfile=${moltempfile} \
     $overridearg | tee molprobify_${num}.log
 
-  # Extract energy and log it
+  # Extract energy and log it; revert snap if it made things worse
   set energy = `grep "weighted energy" molprobify_${num}.log | awk '{print $NF}'`
   if($is_snap) then
-    echo "$num $energy snap" >> itr_vs_energy.txt
+    set snap_bad = `echo $energy $prev_energy | awk '{print ($2<9999 && $1 > $2)}'`
+    if($snap_bad && $propagate) then
+      echo "=== SNAP reverted (snap wE=$energy > pre-snap wE=$prev_energy) — reverting to $pre_snap_startpdb ==="
+      set startpdb = $pre_snap_startpdb
+      echo "$num $energy snap_reverted" >> itr_vs_energy.txt
+    else
+      echo "$num $energy snap" >> itr_vs_energy.txt
+    endif
   else
     echo "$num $energy" >> itr_vs_energy.txt
+    set prev_energy = $energy
+    set pre_snap_startpdb = $startpdb
   endif
   echo "Iteration $num : energy = $energy"
 
@@ -222,17 +253,14 @@ foreach x ( `seq 1 $maxcycles` )
   ${scriptdir}/reweight_opts_runme.com maxadd=$maxadd
   cp refmac_opts_new.txt refmac_opts.txt
 
+  if($fudgeify) then
+    python3 ${scriptdir}/fudgeify.py ${prefix}_${num}_fullgeo.txt \
+      maxadd=$maxadd outfile=phenix_fudge.eff $overridearg
+  endif
+
   # Slow sigma escalation: tighten all external restraints by 1% per cycle,
   # drop distance restraints that went slack (sigma >= 5)
-  cat refmac_opts.txt |\
-  awk '{sc=0}\
-       /^extern inter/{sc=26}\
-       /^extern dist/{sc=24}\
-       /^extern plane/{sc=NF}\
-       sc{$sc*=1.01}\
-       /^extern dist/ && $sc>=5{next}\
-       /^extern inter/ && $sc>=5{next}\
-       {print}' >! refmac_opts_new.txt
+  awk '{sc=0} /^extern inter/{sc=26} /^extern dist/{sc=24} /^extern plane/{sc=NF} sc{$sc*=1.01} /^extern dist/ && $sc>=5{next} /^extern inter/ && $sc>=5{next} {print}' refmac_opts.txt >! refmac_opts_new.txt
   mv refmac_opts_new.txt refmac_opts.txt
 
 end

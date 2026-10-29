@@ -33,8 +33,8 @@ end
 if(! -e refmac_opts.txt) touch refmac_opts.txt
 
 
-set file = refmac_opts_declash.txt
-if( ! -s $file ) set file = refmac_opts_debump.txt
+set file = refmac_opts_debump.txt
+if( ! -s $file ) set file = refmac_opts_declash.txt
 
 
 egrep "extern interv" $file |\
@@ -61,7 +61,7 @@ awk '! /^extern/{next} $2!="interval"{next}\
   END{for(keys in seen){\
     if(! printed[keys] && line[keys]!=""){print line[keys]; ++printed[keys]};\
   }}' |\
- awk 'BEGIN{sc=26} $sc=="new"{$sc="4"}\
+ awk 'BEGIN{sc=26} $sc=="new"{$sc="0.4"}\
    $sc<0.1{$sc=0.1}\
    NF>10{print}' |\
 sort -k26g |\
@@ -199,7 +199,7 @@ awk '! /^extern/{next} $2!="plane"{next}\
     if(! printed[keys] && line[keys]!=""){print line[keys]; ++printed[keys]};\
   }}' |\
  awk '$NF=="new"{$NF=0.02}\
-   $NF<1e-7{$NF=1e-7}\
+   $NF<0.001{$NF=0.001}\
    NF>10{print}' |\
  tee new_planes.txt 
 
