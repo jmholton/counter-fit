@@ -47,6 +47,7 @@ awk '! /^extern/{next} $2!="interval"{next}\
   c2=$14;r2=$16;a2=$18;f2=$20;sc=26;\
   key1=c1" "r1" "a1" "f1;\
   key2=c2" "r2" "a2" "f2;\
+  for(i=29;i<NF;++i)if($i=="symop")key2=key2" "$(i+1);\
   line[key1,key2]=$0;\
   sigma=$sc;}\
   sigma=="new"{\
@@ -301,11 +302,13 @@ cat >! default_geo.txt
      c1=$5;r1=$7;a1=$9;f1=$11;\
      c2=$14;r2=$16;a2=$18;f2=$20;\
      v=$22;s=$26;\
+     sym="";for(i=29;i<NF;++i)if($i=="symop")sym=$(i+1);\
 #   print "    #",c1,c2,a1,a2,r1,r2,f1,f2,v,s;\
    print "    bond {"\
    print "      action = *add";\
    print "      atom_selection_1 = \"name",a1,"and resseq",r1,"and chain",c1,"and altid",f1 "\"";\
    print "      atom_selection_2 = \"name",a2,"and resseq",r2,"and chain",c2,"and altid",f2 "\"";\
+   if(sym!="")print "      symmetry_operation =",sym;\
    print "      distance_ideal =",v+deadband;\
    print "      sigma =",s;\
    print "      slack =",deadband;\

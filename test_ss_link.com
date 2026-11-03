@@ -95,10 +95,11 @@ end
 
 echo ""
 echo "=== Summary ==="
-set nolink_angle = `awk '/^angle pdb=/{a1=$0;getline;a2=$0;getline;a3=$0;getline;getline;\
+set nolink_angle = ""
+if(-e nolink_001.geo) set nolink_angle = `awk '/^angle pdb=/{a1=$0;getline;a2=$0;getline;a3=$0;getline;getline;\
   if((a1~/CB.*CYS/&&a2~/SG.*CYS/&&a3~/SG.*CYS/)||\
      (a1~/SG.*CYS/&&a2~/SG.*CYS/&&a3~/CB.*CYS/))\
-    {print $1;exit}}' nolink_001.geo 2>/dev/null`
+    {print $1;exit}}' nolink_001.geo`
 
 if("$nolink_angle" == "") then
   echo "No CB-SG-SG angle found without ss_link.cif — Phenix not applying SS geometry."

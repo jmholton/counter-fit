@@ -24,6 +24,10 @@
 #     propagate=0        if 1, each iteration starts from previous output (default 0)
 #     snap_interval=0    if >0, run a snap iteration every N cycles (default 0=off)
 #     snap_wxc=1.0       wxc_scale used during snap iterations (default 1.0)
+#     fudgeify=0         if 1, fudgeify.py writes phenix_fudge.eff instead of reweight_opts
+#     cdl=False          phenix conformation-dependent library, in refinement and
+#                        in molprobify scoring.  CDL rewrites backbone bond
+#                        restraints every macro-cycle, undoing edits to them
 #
 #   Outputs:
 #     start_NNN.pdb    phenix-refined model each iteration
@@ -46,6 +50,7 @@ set propagate     = 0
 set snap_interval = 0
 set snap_wxc      = 1.0
 set fudgeify      = 0
+set cdl           = False
 
 foreach Arg ( $* )
   set key = `echo $Arg | awk -F= '{print $1}'`
@@ -63,6 +68,7 @@ foreach Arg ( $* )
   if("$key" == "snap_interval") set snap_interval = $val
   if("$key" == "snap_wxc")      set snap_wxc      = $val
   if("$key" == "fudgeify")      set fudgeify      = $val
+  if("$key" == "cdl")           set cdl           = $val
 end
 
 if("$pdbfile" == "" || "$mtzfile" == "") then
@@ -71,6 +77,25 @@ if("$pdbfile" == "" || "$mtzfile" == "") then
 endif
 
 set scriptdir = `dirname $0`
+
+# Two runs in one directory corrupt each other's restraint state
+set thishost = `hostname`
+if(-e ground_factory.lock) then
+  set lock = ( `cat ground_factory.lock` )
+  set lockalive = 1
+  if($#lock == 2) then
+    if("$lock[1]" == "$thishost") then
+      ps -p $lock[2] >& /dev/null
+      if($status) set lockalive = 0
+    endif
+  endif
+  if($lockalive) then
+    echo "ERROR: ground_factory.lock says another run ($lock) is using this directory."
+    echo "       Remove ground_factory.lock if that run is dead."
+    exit 1
+  endif
+endif
+echo "$thishost $$" >! ground_factory.lock
 
 set PHENIXRUN = "phenix.refine"
 if($srun) set PHENIXRUN = "srun -p debug phenix.refine"
@@ -137,7 +162,7 @@ if(-s overrides.txt) set overridearg = "overridefile=overrides.txt"
 echo "=== Validating starting model ==="
 mkdir -p this start
 if(! -e start/refmac_opts_debump.txt) then
-  ${scriptdir}/molprobify_runme.com $pdbfile keepgeo=1 writefudge=1 $overridearg
+  ${scriptdir}/molprobify_runme.com $pdbfile keepgeo=1 writefudge=1 cdl=${cdl} $overridearg
   cp refmac_opts_de*.txt refmac_opts_fix*.txt start/
 endif
 
@@ -147,7 +172,7 @@ if(! -e default.geo) then
     prefix=${prefix} serial=001 \
     $ssargs noocc.eff \
     wxc_scale=${wxc} wxu_scale=${wxu} \
-    main.number_of_macro_cycles=5 \
+    main.number_of_macro_cycles=5 cdl=${cdl} \
     write_geo_file=True \
     phenix_holdme.eff phenix_fudge.eff >! phenix_001.log
   if($status) then
@@ -163,21 +188,21 @@ endif
 set num = `ls -1rt ${prefix}_???.pdb | tail -n 1 | awk -F_ '{print substr($NF,1,3)+0}'`
 if("$num" == "") set num = 0
 
-# For forward propagation, resume from the last completed iteration's output
+echo "=== Starting iterative loop from iteration $num ==="
+if(! -e itr_vs_energy.txt) touch itr_vs_energy.txt
+
+# For forward propagation, resume from the last model that was kept (not a reverted snap)
 set startpdb = $pdbfile
 if($propagate) then
-  set _last = `ls -1rt ${prefix}_???.pdb 2>/dev/null | tail -1`
-  if("$_last" != "") set startpdb = $_last
-endif
-
-echo "=== Starting iterative loop from iteration $num ==="
-if($num == 0) then
-  echo "" >! itr_vs_energy.txt
+  set _last = `awk '$2+0==$2 && $3!="snap_reverted"{n=$1} END{print n}' itr_vs_energy.txt`
+  if("$_last" != "") then
+    if(-e ${prefix}_${_last}.pdb) set startpdb = ${prefix}_${_last}.pdb
+  endif
 endif
 
 # Snap revert tracking: prev_energy = last non-snap wE, pre_snap_startpdb = model before snap
-set prev_energy = `grep -v snap itr_vs_energy.txt 2>/dev/null | tail -1 | awk '{print $2+0}'`
-if("$prev_energy" == "0" || "$prev_energy" == "") set prev_energy = 9999
+set prev_energy = `awk '$2+0==$2 && $3==""{e=$2} END{print e+0}' itr_vs_energy.txt`
+if("$prev_energy" == "0") set prev_energy = 9999
 set pre_snap_startpdb = $startpdb
 
 foreach x ( `seq 1 $maxcycles` )
@@ -199,7 +224,7 @@ foreach x ( `seq 1 $maxcycles` )
     prefix=${prefix} serial=${num} \
     $ssargs noocc.eff \
     wxc_scale=${wxc_now} wxu_scale=${wxu} \
-    main.number_of_macro_cycles=5 \
+    main.number_of_macro_cycles=5 cdl=${cdl} \
     write_geo_file=True \
     phenix_holdme.eff phenix_fudge.eff >! phenix_${num}.log
   if($status) then
@@ -223,11 +248,17 @@ foreach x ( `seq 1 $maxcycles` )
   set molwritefudge = writefudge=1
   if($fudgeify) set molwritefudge = ""
   ${scriptdir}/molprobify_runme.com ${prefix}_${num}.pdb keepgeo=1 $molwritefudge debug=1 \
-    tempfile=${moltempfile} \
+    tempfile=${moltempfile} cdl=${cdl} \
     $overridearg | tee molprobify_${num}.log
 
-  # Extract energy and log it; revert snap if it made things worse
-  set energy = `grep "weighted energy" molprobify_${num}.log | awk '{print $NF}'`
+  set energy = `grep -a "weighted energy" molprobify_${num}.log | tail -n 1 | awk '{print $NF}'`
+  set isnum = `echo "$energy" | awk 'NF==1 && $1+0==$1{print 1;exit} {print 0}'`
+  if(! $isnum) then
+    echo "ERROR: no weighted energy in molprobify_${num}.log — stopping"
+    break
+  endif
+
+  # Log the energy; revert a snap that made things worse
   if($is_snap) then
     set snap_bad = `echo $energy $prev_energy | awk '{print ($2<9999 && $1 > $2)}'`
     if($snap_bad && $propagate) then
@@ -256,6 +287,10 @@ foreach x ( `seq 1 $maxcycles` )
   if($fudgeify) then
     python3 ${scriptdir}/fudgeify.py ${prefix}_${num}_fullgeo.txt \
       maxadd=$maxadd outfile=phenix_fudge.eff $overridearg
+    if($status) then
+      echo "ERROR: fudgeify.py failed at iteration $num — stopping"
+      break
+    endif
   endif
 
   # Slow sigma escalation: tighten all external restraints by 1% per cycle,
@@ -291,18 +326,16 @@ cp refmac_opts_beforefinal.txt refmac_opts.txt
 cp refmacout.pdb fmodelme.pdb
 
 echo "=== Final validation ==="
-${scriptdir}/molprobify_runme.com fmodelme.pdb keepgeo=1 $overridearg | tee molprobify_fmodelme.log
+${scriptdir}/molprobify_runme.com fmodelme.pdb keepgeo=1 cdl=${cdl} $overridearg | tee molprobify_fmodelme.log
 
 # -----------------------------------------------------------------------
 # Step 6: Ideal structure factors
 # -----------------------------------------------------------------------
-set hires = `grep "_cell.length_a\|CRYST1\|Resolution" $mtzfile \
-  phenix_001.log 2>/dev/null | \
-  awk '/High resolution limit/{print $NF;exit} \
-       /high_resolution/{print $NF;exit}' 2>/dev/null`
-if("$hires" == "") set hires = `grep "high_res\|resolution" phenix_001.log | \
-  awk '/high_resolution/{print $NF;exit}'`
-if("$hires" == "") set hires = 1.5
+set hires = `phenix.mtz.dump $mtzfile | awk '/^Resolution range:/{print $NF;exit}'`
+if("$hires" == "") then
+  echo "WARNING: could not read resolution of $mtzfile, using 1.5 A"
+  set hires = 1.5
+endif
 
 echo "=== phenix.fmodel at ${hires} A ==="
 rm -f fmodel.mtz
@@ -357,3 +390,4 @@ echo "  Final model:         fmodelme.pdb"
 echo "  Clean data:          nonoise.mtz"
 echo "  Noisy data:          simplenoise.mtz"
 echo "  Energy vs iteration: itr_vs_energy.txt"
+rm -f ground_factory.lock

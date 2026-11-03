@@ -73,6 +73,8 @@ set keepgeo = 0
 
 # const_shrink_donor_acceptor override
 set csda = 0.6
+# phenix conformation-dependent library for backbone bond and angle ideals
+set cdl = True
 # sigma of omega
 set sigomega = 4.01398721805631
 
@@ -285,7 +287,7 @@ echo "geometry"
 phenix.geometry_minimization $pdbfile $ciffiles macro_cycles=0 \
   stop_for_unknowns=false \
   allow_polymer_cross_special_position=True \
-  const_shrink_donor_acceptor=$csda \
+  const_shrink_donor_acceptor=$csda cdl=$cdl \
   output_file_name_prefix=${t} >! ${outprefix}_geom.log
 # logfile is "greatest hits" only
 
@@ -299,11 +301,11 @@ cat ${t}.geo |\
 awk '/nonbonded pdb=/{key="NONBOND";split($0,w,"\"");id1=w[2];\
      getline;split($0,w,"\"");id2=w[2];\
      getline;getline;\
-     obs=$1;ideal=$2;sigma=1;energy=lj(obs,ideal);}\
+     obs=$1;ideal=$2;sigma=1;energy=lj(obs,ideal);if($3~/,/)sym=$3;}\
    /bond pdb=/{key="BOND";split($0,w,"\"");id1=w[2];\
      getline;split($0,w,"\"");id2=w[2];\
      getline;getline;\
-     ideal=$1;obs=$2;sigma=$4;energy=$6}\
+     ideal=$1;obs=$2;sigma=$4;energy=$6;if($NF~/,/)sym=$NF}\
    /angle pdb=/{key="ANGLE";split($0,w,"\"");id1=w[2];\
      getline;split($0,w,"\"");id2=w[2];\
      getline;split($0,w,"\"");id3=w[2];\
@@ -344,13 +346,15 @@ awk '/nonbonded pdb=/{key="NONBOND";split($0,w,"\"");id1=w[2];\
      nid3=sprintf("%4s %s %4s %s %5s",a3,f3,t3,c3,r3);\
      nid4=sprintf("%4s %s %4s %s %5s",a4,f4,t4,c4,r4);\
      ids=nid1; if(nid2~/[0-9]/)ids=ids" - "nid2; if(nid3~/[0-9]/)ids=ids" - "nid3;if(nid4~/[0-9]/)ids=ids" - "nid4;\
+     if(sym!="" && sym!="x,y,z")ids=ids" symop="sym;\
      print key,energy+0,ideal-obs,obs,ideal,sigma+0,"|",ids;\
-     id1=id2=id3=id4=""} \
+     id1=id2=id3=id4=sym=""} \
    function lj0(r,r0) {if(r==0)return 1e40;return 4*((r0*2^(-1./6)/r)^12-(r0*2^(-1./6)/r)^6)}\
  function lj(r,r0) {return lj0(r,r0)-lj0(6,r0)}' |\
 sort -k2gr |\
 cat >! ${t}_fullgeo.txt
 # format: key energy dev obs ideal sigma | atominfo
+# contacts with a symmetry mate end in symop=<op>, the .geo sym.op. applied to the 2nd atom
 
 echo $ignore |\
 cat - ${t}_fullgeo.txt |\
@@ -382,7 +386,7 @@ cat >! ${t}_geo.txt
 #
 
 # get sequence
-awk -F "|" '{print $2}' ${t}_fullgeo.txt |\
+awk -F "|" '{s=$2;sub(/ symop=.*/,"",s);print s}' ${t}_fullgeo.txt |\
  awk -F "-" '{for(i=1;i<=NF;++i)print $i}' |\
  awk '{print $3,$4,$5}' |\
 sort -u |\
@@ -855,7 +859,7 @@ awk '! /^BOND/{next}\
 sort -u >! ${t}_parents.txt
 
 # grab all non-bad atoms and hold in place
-awk '$2>0{print $2+0.0001,"-"substr($0,index($0,"|")+1)}' ${t}_fullgeo.txt |\
+awk '$2>0{s=substr($0,index($0,"|")+1);sub(/ symop=.*/,"",s);print $2+0.0001,"-"s}' ${t}_fullgeo.txt |\
 awk -F "-" '{for(a=2;a<=NF;++a)print $1,"-"$a}' |\
 awk '{while(gsub(/ $/,""));while(gsub("  "," "));print}' |\
 cat ${t}_parents.txt - |\
@@ -911,6 +915,7 @@ awk '/^select/{del[$3,$4,$5,$6,$7]=del[$8,$9,$10,$11,$12]=$2;next}\
    id2=substr(nxt,1);\
    split(id1,w);a1=w[1];f1=w[2];t1=w[3];c1=w[4];r1=w[5];\
    split(id2,w);a2=w[1];f2=w[2];t2=w[3];c2=w[4];r2=w[5];\
+   sym=w[6];sub(/^symop=/,"",sym);symm="";if(sym!="")symm=" symm y ! symop "sym;\
    gsub(" ","_",f1);gsub(" ","_",f2);\
    gsub(" ","_",c1);gsub(" ","_",c2);\
   }\
@@ -919,10 +924,10 @@ awk '/^select/{del[$3,$4,$5,$6,$7]=del[$8,$9,$10,$11,$12]=$2;next}\
    ideal=$5+del[a1,f1,t1,c1,r1];sigma=0.2;\
    print "extern interval first chain",c1,"resi",r1,"atom",a1,"altecode",f1,\
       "seco chain",c2,"resi",r2,"atom",a2,"altecode",f2,\
-      "dmin",ideal,"dmax 9999","smin",sigma,"smax 9999";\
+      "dmin",ideal,"dmax 9999","smin",sigma,"smax 9999" symm;\
    print "#extern dist first chain",c1,"resi",r1,"atom",a1,"altecode",f1,\
       "seco chain",c2,"resi",r2,"atom",a2,"altecode",f2,\
-      "value",ideal,"sigma",sigma,"type 0"}' |\
+      "value",ideal,"sigma",sigma,"type 0" symm}' |\
 awk '{gsub("chain _","");print}' |\
 egrep "^extern|^#extern" >! refmac_opts_declash.txt
 
@@ -937,6 +942,7 @@ awk '/^select/{del[$3,$4,$5,$6,$7]=del[$8,$9,$10,$11,$12]=$2;next}\
    id2=substr(nxt,1);\
    split(id1,w);a1=w[1];f1=w[2];t1=w[3];c1=w[4];r1=w[5];\
    split(id2,w);a2=w[1];f2=w[2];t2=w[3];c2=w[4];r2=w[5];\
+   sym=w[6];sub(/^symop=/,"",sym);\
    gsub(" ","_",f1);gsub(" ","_",f2);\
    gsub(" ","_",c1);gsub(" ","_",c2);\
   }\
@@ -948,6 +954,7 @@ awk '/^select/{del[$3,$4,$5,$6,$7]=del[$8,$9,$10,$11,$12]=$2;next}\
    print "      action = *add";\
    print "      atom_selection_1 = \"name",a1,"and resseq",r1,"and chain",c1,"and altid",f1 "\"";\
    print "      atom_selection_2 = \"name",a2,"and resseq",r2,"and chain",c2,"and altid",f2 "\"";\
+   if(sym!="")print "      symmetry_operation =",sym;\
    print "      distance_ideal =",ideal+deadband;\
    print "      sigma =",sigma;\
    print "      slack =",deadband/2;\
@@ -975,14 +982,15 @@ awk '/^PARENT/{parent[$2,$3]=$5;next}\
    print "|"id2"|";\
    split(id1,w);a1=w[1];f1=w[2];t1=w[3];c1=w[4];r1=w[5];\
    split(id2,w);a2=w[1];f2=w[2];t2=w[3];c2=w[4];r2=w[5];\
+   sym=w[6];sub(/^symop=/,"",sym);if(sym=="")sym="x,y,z";\
    gsub(" ","_",f1);gsub(" ","_",f2);\
    gsub(" ","_",c1);gsub(" ","_",c2);\
    energy=$2;delta=$3;ideal=$5;\
    if(parent[a1,t1]){a1=parent[a1,t1];delta+=0.1}\
    if(parent[a2,t2]){a2=parent[a2,t2];delta+=0.1}\
-   print "select",energy,delta,ideal,a1,f1,t1,c1,r1,a2,f2,t2,c2,r2}' |\
+   print "select",energy,delta,ideal,a1,f1,t1,c1,r1,a2,f2,t2,c2,r2,sym}' |\
 egrep "^select" >! ${t}_selections.txt
-# parent atoms selected
+# parent atoms selected, symmetry operator last
 
 # now look for distance between parent atoms in the non-bond list
 # if its not there, make something up
@@ -990,7 +998,7 @@ cat ${t}_selections.txt ${t}_fullgeo.txt |\
 awk '/^select/{\
      a1 =$5;f1 =$6;t1 =$7;c1 =$8;r1 =$9;\
      a2=$10;f2=$11;t2=$12;c2=$13;r2=$14;\
-     key=a1" "f1" "c1" "r1" "a2" "f2" "c2" "r2;\
+     key=a1" "f1" "c1" "r1" "a2" "f2" "c2" "r2" "$15;\
      oldE[key]=$2;\
      olddel[key]=$3;\
      oldideal[key]=$4;\
@@ -1003,10 +1011,11 @@ awk '/^select/{\
    id2=substr(nxt,1);\
    split(id1,w);a1=w[1];f1=w[2];t1=w[3];c1=w[4];r1=w[5];\
    split(id2,w);a2=w[1];f2=w[2];t2=w[3];c2=w[4];r2=w[5];\
+   sym=w[6];sub(/^symop=/,"",sym);if(sym=="")sym="x,y,z";\
    gsub(" ","_",f1);gsub(" ","_",f2);\
    gsub(" ","_",c1);gsub(" ","_",c2);\
    energy=$2;delta=$3;ideal=$5;\
-   key=a1" "f1" "c1" "r1" "a2" "f2" "c2" "r2;\
+   key=a1" "f1" "c1" "r1" "a2" "f2" "c2" "r2" "sym;\
    #print del[key]+0,selected[key],key;\
   }\
   selected[key]{\
@@ -1015,27 +1024,29 @@ awk '/^select/{\
    ideal+=dd;delta+=dd;\
    sigma=0.4/(delta+1.1);\
    if(sigma<0.001)sigma=0.001;\
+   symm="";if(sym!="x,y,z")symm=" symm y ! symop "sym;\
    print "extern interval first chain",c1,"resi",r1,"atom",a1,"altecode",f1,\
       "seco chain",c2,"resi",r2,"atom",a2,"altecode",f2,\
-      "dmin",ideal,"dmax 9999","smin",sigma,"smax 9999";\
+      "dmin",ideal,"dmax 9999","smin",sigma,"smax 9999" symm;\
    print "#extern dist first chain",c1,"resi",r1,"atom",a1,"altecode",f1,\
       "seco chain",c2,"resi",r2,"atom",a2,"altecode",f2,\
-      "value",ideal,"sigma",sigma,"type 0";\
+      "value",ideal,"sigma",sigma,"type 0" symm;\
    ++printed[key]}\
   END{for(key in selected){\
    if(selected[key] && ! printed[key]){\
      split(key,w);\
      a1=w[1];f1=w[2];c1=w[3];r1=w[4];\
      a2=w[5];f2=w[6];c2=w[7];r2=w[8];\
+     symm="";if(w[9]!="x,y,z")symm=" symm y ! symop "w[9];\
      sigma=0.4/(olddel[key]+1.1);\
      ideal=oldideal[key]+olddel[key]+0.7;\
      print selected[key],( ! selected[key] ),del[key],key;\
      print "extern interval first chain",c1,"resi",r1,"atom",a1,"altecode",f1,\
         "seco chain",c2,"resi",r2,"atom",a2,"altecode",f2,\
-        "dmin",ideal,"dmax 9999","smin",sigma,"smax 9999";\
+        "dmin",ideal,"dmax 9999","smin",sigma,"smax 9999" symm;\
      print "#extern dist first chain",c1,"resi",r1,"atom",a1,"altecode",f1,\
         "seco chain",c2,"resi",r2,"atom",a2,"altecode",f2,\
-        "value",ideal,"sigma",sigma,"type 0";\
+        "value",ideal,"sigma",sigma,"type 0" symm;\
    };\
   }}' |\
 tee ${t}debump.txt |\
@@ -1229,11 +1240,13 @@ foreach suff ( declash debump )
      c1=$5;r1=$7;a1=$9;f1=$11;\
      c2=$14;r2=$16;a2=$18;f2=$20;\
      v=$22;s=$24;\
+     sym="";for(i=25;i<NF;++i)if($i=="symop")sym=$(i+1);\
    print "    #",c1,c2,a1,a2,r1,r2,f1,f2,v,s;\
    print "    bond {"\
    print "      action = *add";\
    print "      atom_selection_1 = \"name",a1,"and resseq",r1,"and chain",c1,"and altid",f1 "\"";\
    print "      atom_selection_2 = \"name",a2,"and resseq",r2,"and chain",c2,"and altid",f2 "\"";\
+   if(sym!="")print "      symmetry_operation =",sym;\
    print "      distance_ideal =",v+deadband;\
    print "      sigma =",s;\
    print "      slack =",deadband;\

@@ -9,6 +9,11 @@ MolProbity, update harmonic hold-back restraints on atoms that are getting
 worse, then add or tighten one geometry-correction restraint per outlier type.
 Repeat until the weighted energy score converges (target wE < 9).
 
+Every cycle refines the same starting model, and sigmas change gradually
+(÷1.5 for the worst outliers, ×1.01 for everything else), because the system
+is prone to instability.  Changes are never undone: if wE goes up, something
+else needs more restraint, and the next cycle gives it that.
+
 ---
 
 ## Pipeline scripts
@@ -31,8 +36,10 @@ ground_factory_runme.com  model.pdb  data.mtz  [options]
   snap_wxc=1.0       wxc_scale for snap iterations
   fudgeify=0         if 1, use fudgeify.py instead of reweight_opts for
                      phenix_fudge.eff (recommended for new runs)
-  overrides=file     TORSION OVERRIDE file — residues with genuine outliers
-                     that must not be tightened
+  cdl=False          phenix conformation-dependent library, in refinement and
+                     in molprobify scoring (CDL undoes backbone bond edits)
+  overrides=file     TORSION OVERRIDE file — genuine outliers that must not
+                     be tightened (see OVERRIDE policy below)
 ```
 
 **Outputs**
@@ -40,13 +47,14 @@ ground_factory_runme.com  model.pdb  data.mtz  [options]
 | File | Description |
 |------|-------------|
 | `start_NNN.pdb` | phenix model each iteration |
-| `itr_vs_energy.txt` | weighted energy vs iteration number |
+| `itr_vs_energy.txt` | weighted energy vs iteration number (`snap`, `snap_reverted` tags) |
 | `phenix_holdme.eff` | harmonic positional restraints (good atoms held back) |
 | `phenix_fudge.eff` | geometry-correction restraints (problem atoms) |
 | `refmac_opts.txt` | same restraints in REFMAC external format |
 | `fudge_table.txt` | fudgeify state: sigma history across cycles |
+| `ground_factory.lock` | host and PID of the run using this directory |
 | `fmodelme.pdb` | final model after REFMAC B-factor convergence |
-| `nonoise.mtz` / `simplenoise.mtz` | ideal / ~3%-noisy structure factors |
+| `nonoise.mtz` / `simplenoise.mtz` | ideal / ~3%-noisy structure factors, at the resolution of the input mtz |
 
 **Loop per iteration**
 
@@ -57,6 +65,9 @@ ground_factory_runme.com  model.pdb  data.mtz  [options]
    (overwritten by fudgeify when `fudgeify=1`)
 5. `fudgeify.py` (if `fudgeify=1`) → update `fudge_table.txt`, overwrite `phenix_fudge.eff`
 6. 1 % sigma escalation on all entries in `refmac_opts.txt`
+
+The loop stops at `maxcycles`, or when phenix, molprobify or fudgeify fails.
+The final REFMAC step starts from the last iteration.
 
 ---
 
@@ -76,7 +87,14 @@ in the format:
 TYPE  energy  delta  obs  ideal  sigma | atom1 altid resname chain resi - atom2 …
 ```
 
-Types: `NONBOND`, `BOND`, `ANGLE`, `TORSION`, `PLANE`.
+Ideal values come from `phenix.geometry_minimization`, with CDL on unless
+`cdl=False` is given (ground_factory passes its own setting).
+
+Types: `NONBOND`, `BOND`, `ANGLE`, `TORSION`, `PLANE`.  A contact with a
+symmetry mate ends in `symop=<op>`: the `.geo` `sym.op.`, applied to the
+second atom.  Every restraint made from such a contact carries the operator
+(`symmetry_operation` for phenix, `symm y` for REFMAC, with the explicit
+operator in a trailing `! symop` comment).
 
 ---
 
@@ -120,27 +138,30 @@ When `fudgeify=1`, this file is immediately overwritten by `fudgeify.py`.
 Python replacement for the tcsh/awk fudge-generation logic in
 `reweight_opts_runme.com`.  Recommended for new runs (`fudgeify=1`).
 
-Reads the current iteration's `*_fullgeo.txt`; accumulates sigma state in
-`fudge_table.txt`; writes `phenix_fudge.eff`.
-
-**Sigma behaviour**
+Reads a `*_fullgeo.txt`; accumulates sigma state in `fudge_table.txt`;
+writes `phenix_fudge.eff`.  Each call is one cycle:
 
 | Event | Action |
 |-------|--------|
-| Restraint appears in new outlier list | Add at natural sigma (NONBOND: `0.4/(|delta|+1.1)`) |
-| Restraint still in outlier list | Tighten: `sigma /= 1.5` (with type floor) |
-| Restraint no longer an outlier | Escalate: `sigma *= 1.01` |
+| One of the worst `maxadd` outliers of its type, not yet in the table | Add: NONBOND at `0.4/(|delta|+1.1)`; BOND/ANGLE/TORSION at natural sigma/1.5 (they change phenix's own restraint, so natural sigma would change nothing) |
+| One of the worst `maxadd` outliers of its type, already in the table | Tighten: `sigma /= 1.5`, down to the reweight_opts floors (NONBOND 0.1, BOND 0.001, ANGLE and TORSION 0.01) |
+| Anything else in the table | Relax: `sigma *= 1.01` |
 | NONBOND or BOND sigma ≥ 5 | Drop (restraint resolved) |
 
-**Sigma floors on tightening** (prevents numerical blowup in phenix)
+Bond changes need phenix's conformation-dependent library off, which is
+ground_factory's default (`cdl=False`).  CDL sets the C–N, N–CA, CA–CB, CA–C
+and C–O bonds from phi/psi after the edits are applied, and again every
+macro-cycle, so with CDL on an edit to one of those bonds changes nothing.
+(CDL leaves edited angles alone.)  molprobify scores with the same setting,
+so refinement and wE use the same ideal values.  Bonds between symmetry
+mates are not changed.
 
-| Type | Floor |
-|------|-------|
-| BOND | 0.001 Å |
-| NONBOND | 0.001 Å |
-| ANGLE | **0.5 °** |
-| TORSION | **5.0 °** |
-| PLANE | 0.001 (not yet implemented) |
+NONBOND entries between symmetry mates keep the operator (`sym=` in the
+table, `symmetry_operation` in the eff).  A torsion phenix already restrains
+(found in `default.geo`) is changed in place rather than added, because phenix
+refuses duplicate dihedrals; fudge torsions are harmonic (`periodicity = 0`;
+phenix's default of 1 means sinusoidal).  Torsions named in `overrides.txt`
+are skipped (exact atom match, either direction).
 
 **Usage**
 
@@ -170,7 +191,7 @@ default 104.2°).  Uses `apply_cif_link` because
 | `ss_link.cif/eff` | make_ss_link | SS-bond geometry (if SS bonds present) |
 | `default.geo` | phenix iteration 001 | Reference geometry for redo_harmonics |
 | `fudge_table.txt` | fudgeify | Sigma state across cycles |
-| `overrides.txt` | user-supplied or empty | TORSION OVERRIDE: genuine outliers to skip |
+| `overrides.txt` | user-supplied before the run, or empty | TORSION OVERRIDE: genuine outliers to skip |
 
 ---
 
@@ -185,7 +206,9 @@ cd /my/target/dir
 
 Resume after interruption: re-run the same command; the pipeline skips
 iterations whose `start_NNN.pdb` already exists and picks up from the last
-completed one.
+completed one.  A second run in the same directory refuses to start while
+`ground_factory.lock` names a live process; delete the lock if that run is
+dead on another host.
 
 ---
 
@@ -198,5 +221,8 @@ completed one.
 - Phenix planarity restraints via `geometry_restraints.edits` are unreliable
   for peptide planes; plane corrections go through REFMAC
   `extern plane` entries instead.
-- OVERRIDE policy: add a residue to `overrides.txt` only when Fo−Fc difference
-  density appears near a tightened restraint — not based on wE score alone.
+- OVERRIDE policy: `overrides.txt` is populated only at the beginning, from
+  obvious outliers in obviously good density.  Nothing adds to it during a
+  run.
+- tcsh has no `2>/dev/null`: inside backticks it either swallows the output
+  or fails with "Ambiguous output redirect".  Test for the file first.

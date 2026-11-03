@@ -5,12 +5,23 @@ fudgeify.py  - James Holton  Oct-26
 Read the fullgeo output of molprobify and generate phenix geometry
 correction restraints, accumulating sigma-tightening state in fudge_table.txt.
 
+Each call is one ground_factory cycle: the worst maxadd outliers of each type
+are added or tightened (sigma/1.5, down to the floors reweight_opts uses), and
+every other entry is relaxed (sigma*1.01); NONBOND and BOND entries are
+dropped once relaxed to sigma 5.  A new NONBOND restraint starts at
+0.4/(|delta|+1.1); a new BOND, ANGLE or TORSION entry changes phenix's own
+restraint, so it starts at natural sigma/1.5.  Changes to backbone bonds
+only take effect with phenix's CDL off (ground_factory cdl=False): CDL
+rewrites them every macro-cycle.
+
 Table format (fudge_table.txt):
   NONBOND  C1 R1 A1 F1  C2 R2 A2 F2  dmin sigma
   BOND     C1 R1 A1 F1  C2 R2 A2 F2  value sigma
   ANGLE    C1 R1 A1 F1  C2 R2 A2 F2  C3 R3 A3 F3  value sigma
   TORSION  C1 R1 A1 F1  C2 R2 A2 F2  C3 R3 A3 F3  C4 R4 A4 F4  value sigma period
   PLANE    sigma  C1 R1 A1 F1  C2 R2 A2 F2  ...
+A NONBOND with a symmetry mate ends in sym=OP, the operator applied to the
+second atom.
 
 Atom fields: C=chain, R=resi, A=atomname, F=altid  ("_" = blank)
 """
@@ -32,7 +43,7 @@ def parse_args():
     p.add_argument("--maxadd",      type=int,   default=1)
     p.add_argument("--sigma_fudge", type=float, default=1.0)
     p.add_argument("--outfile",     default="phenix_fudge.eff")
-    p.add_argument("--geo",         default="")
+    p.add_argument("--geo",         default="default.geo")
     p.add_argument("--cbetadev",    default="")
     p.add_argument("--overridefile",default="")
 
@@ -98,30 +109,49 @@ def parse_atom_specs(pipe_section):
 def is_heavy(atomname):
     return not atomname.startswith("H")
 
+def load_dihedrals(geo_path):
+    """Atoms of every dihedral phenix already restrains, from a phenix.refine
+    .geo file, as tuples of (C, R, A, F).  phenix refuses to *add these."""
+    dihedrals = set()
+    if not geo_path or not os.path.exists(geo_path):
+        return dihedrals
+    with open(geo_path) as f:
+        lines = iter(f)
+        for line in lines:
+            if not line.startswith("dihedral pdb="):
+                continue
+            ids = [line] + [next(lines, "") for i in range(3)]
+            atoms = []
+            for s in ids:
+                w = s.split('"')
+                if len(w) < 2 or len(w[1]) < 15:
+                    break
+                pid = w[1]
+                atoms.append((blank(pid[9]), pid[10:15].strip(), pid[0:4].strip(), blank(pid[4])))
+            if len(atoms) == 4:
+                dihedrals.add(tuple(atoms))
+    return dihedrals
+
 # ---------------------------------------------------------------------------
 # Step 1: Extract proposals from fullgeo
 # ---------------------------------------------------------------------------
 
-SIGMA_COLS = {
-    "NONBOND": -1,   # last field
-    "BOND":    -1,
-    "ANGLE":   -1,
-    "TORSION": -2,   # second-to-last (period is last)
-    "PLANE":    1,   # index 1 (0-based) after split
-}
-
-def table_key(fields):
-    """Return the identity key for an entry (atom coordinates, not sigma/value)."""
+def entry_key(fields, attrs):
+    """Identity of an entry (atoms and symmetry, not sigma/value), as text."""
     t = fields[0]
     if t in ("NONBOND", "BOND"):
-        return tuple(fields[:9])    # type + 2 atoms (4 fields each)
+        k = fields[:9]      # type + 2 atoms (4 fields each)
     elif t == "ANGLE":
-        return tuple(fields[:13])   # type + 3 atoms
+        k = fields[:13]     # type + 3 atoms
     elif t == "TORSION":
-        return tuple(fields[:17])   # type + 4 atoms
+        k = fields[:17]     # type + 4 atoms
     elif t == "PLANE":
-        return tuple(fields[2:])    # type sigma then atoms; key = atoms only
-    return tuple(fields)
+        k = [t] + fields[2:]    # type sigma then atoms; key = atoms only
+    else:
+        k = fields
+    if attrs.get("sym"):
+        k = k + [attrs["sym"]]
+    return " ".join(k)
 
 def sigma_index(fields):
     """0-based index of sigma field in a fields list."""
@@ -134,16 +164,16 @@ def sigma_index(fields):
         return len(fields) - 1
 
 def extract_proposals(fullgeo_path, sigma_fudge, geo_path="", cbetadev_path="", override_path=""):
-    """Return list of field-lists (proposals) from fullgeo."""
+    """Return list of (fields, attrs) proposals from fullgeo, worst first."""
     proposals = []
 
-    # Load override residues to skip torsions
+    # Overridden torsions:  TORSION OVERRIDE target sigma | A_resi A_resi A_resi A_resi
     overridden = set()
     if override_path and os.path.exists(override_path):
         with open(override_path) as f:
             for line in f:
-                if "TORSION" in line and "OVERRIDE" in line:
-                    overridden.add(line.strip())
+                if line.startswith("TORSION") and "OVERRIDE" in line and "|" in line:
+                    overridden.add(tuple(line.split("|", 1)[1].split()))
 
     with open(fullgeo_path) as f:
         for line in f:
@@ -170,6 +200,13 @@ def extract_proposals(fullgeo_path, sigma_fudge, geo_path="", cbetadev_path="", 
             if energy <= sigma_fudge:
                 continue
 
+            # contact with a symmetry mate: operator applies to the second atom
+            sym = ""
+            m = re.search(r"\s+symop=(\S+)", pipe)
+            if m:
+                sym = m.group(1)
+                pipe = pipe[:m.start()]
+
             atoms = parse_atom_specs(pipe)
 
             if typ == "NONBOND":
@@ -181,10 +218,14 @@ def extract_proposals(fullgeo_path, sigma_fudge, geo_path="", cbetadev_path="", 
                     continue
                 dmin  = ideal
                 sigma = 0.4 / (abs(delta) + 1.1)
-                proposals.append(["NONBOND", c1,r1,a1,f1, c2,r2,a2,f2, f"{dmin:.4f}", f"{sigma:.4f}"])
+                attrs = {"sym": sym} if sym else {}
+                proposals.append((["NONBOND", c1,r1,a1,f1, c2,r2,a2,f2, f"{dmin:.4f}", f"{sigma:.4f}"], attrs))
 
             elif typ == "BOND":
                 if len(atoms) < 2:
+                    continue
+                # phenix cannot *change a bond between symmetry mates
+                if sym:
                     continue
                 c1,r1,a1,f1 = atoms[0]
                 c2,r2,a2,f2 = atoms[1]
@@ -193,7 +234,7 @@ def extract_proposals(fullgeo_path, sigma_fudge, geo_path="", cbetadev_path="", 
                 if a1 == "SG" and a2 == "SG":
                     continue
                 sigma_use = max(sigma_nat, 0.001)
-                proposals.append(["BOND", c1,r1,a1,f1, c2,r2,a2,f2, f"{ideal:.4f}", f"{sigma_use:.6f}"])
+                proposals.append((["BOND", c1,r1,a1,f1, c2,r2,a2,f2, f"{ideal:.4f}", f"{sigma_use:.6f}"], {}))
 
             elif typ == "ANGLE":
                 if len(atoms) < 3:
@@ -204,7 +245,7 @@ def extract_proposals(fullgeo_path, sigma_fudge, geo_path="", cbetadev_path="", 
                 if not all(is_heavy(a) for a in (a1,a2,a3)):
                     continue
                 sigma_use = max(sigma_nat, 0.001)
-                proposals.append(["ANGLE", c1,r1,a1,f1, c2,r2,a2,f2, c3,r3,a3,f3, f"{ideal:.4f}", f"{sigma_use:.6f}"])
+                proposals.append((["ANGLE", c1,r1,a1,f1, c2,r2,a2,f2, c3,r3,a3,f3, f"{ideal:.4f}", f"{sigma_use:.6f}"], {}))
 
             elif typ == "TORSION":
                 if len(atoms) < 4:
@@ -218,17 +259,13 @@ def extract_proposals(fullgeo_path, sigma_fudge, geo_path="", cbetadev_path="", 
                 # Skip N/C-CA-CB (CBdev)
                 if a3 == "CA" and a4 == "CB" and a1 in ("N","C") and a2 in ("N","C"):
                     continue
-                # Check overrides (simple: skip if any override line mentions this residue+chain)
-                skip = False
-                for ov in overridden:
-                    if r1 in ov and c1 in ov:
-                        skip = True
-                        break
-                if skip:
+                # Skip torsions named in the override file (either direction)
+                ov = tuple(f"{a}_{r}" for c, r, a, f in atoms[:4])
+                if ov in overridden or ov[::-1] in overridden:
                     continue
                 sigma_use = max(sigma_nat, 0.001)
-                proposals.append(["TORSION", c1,r1,a1,f1, c2,r2,a2,f2, c3,r3,a3,f3, c4,r4,a4,f4,
-                                   f"{ideal:.4f}", f"{sigma_use:.6f}", "0"])
+                proposals.append((["TORSION", c1,r1,a1,f1, c2,r2,a2,f2, c3,r3,a3,f3, c4,r4,a4,f4,
+                                   f"{ideal:.4f}", f"{sigma_use:.6f}", "0"], {}))
 
     # CBdev pseudo-dihedrals
     if cbetadev_path and os.path.exists(cbetadev_path):
@@ -256,8 +293,8 @@ def extract_proposals(fullgeo_path, sigma_fudge, geo_path="", cbetadev_path="", 
                 ncab = ideal_ncab.get(res, 122.8)
                 cnab = ideal_cnab.get(res, -122.6)
                 for v, desc in [(ncab,"N"), (cnab,"C")]:
-                    proposals.append(["TORSION", c,r,desc,alt, c,r,("C" if desc=="N" else "N"),alt,
-                                       c,r,"CA",alt, c,r,"CB",alt, f"{v:.4f}", "2.5", "0"])
+                    proposals.append((["TORSION", c,r,desc,alt, c,r,("C" if desc=="N" else "N"),alt,
+                                       c,r,"CA",alt, c,r,"CB",alt, f"{v:.4f}", "2.5", "0"], {}))
 
     # PLANE from .geo file (only first atom per plane given in fullgeo, so skip for now unless geo provided)
     # geo parsing is complex; stub for future implementation
@@ -271,7 +308,7 @@ def extract_proposals(fullgeo_path, sigma_fudge, geo_path="", cbetadev_path="", 
 # ---------------------------------------------------------------------------
 
 def load_table(table_path):
-    """Return list of field-lists from existing table."""
+    """Return list of (fields, attrs) from existing table."""
     entries = []
     if not os.path.exists(table_path):
         return entries
@@ -280,60 +317,75 @@ def load_table(table_path):
             line = line.rstrip()
             if not line or line.startswith("#"):
                 continue
-            fields = line.split()
+            words  = line.split()
+            fields = [w for w in words if "=" not in w]
+            attrs  = dict(w.split("=", 1) for w in words if "=" in w)
             if len(fields) >= 4:
-                entries.append(fields)
+                entries.append((fields, attrs))
     return entries
 
+# Tightening floors, the same as reweight_opts_runme.com
+FLOORS = {"NONBOND": 0.1, "BOND": 0.001, "ANGLE": 0.01, "TORSION": 0.01, "PLANE": 0.001}
+
+def tighten(fields, sig):
+    """sigma/1.5, not below the floor for its type, and never looser."""
+    return max(sig / 1.5, min(sig, FLOORS.get(fields[0], 0.001)))
+
 def accumulate(proposals, table_entries, maxadd):
-    """Escalate existing sigmas, tighten matches, add new entries."""
-    # Index proposals by key (up to maxadd per type)
-    prop_by_key = {}
-    prop_count  = {}
+    """Tighten or add the worst maxadd proposals of each type; relax the rest 1%.
+
+    Returns the new entries and how many were tightened and added.
+    """
+    chosen = {}
+    count  = {}
     for p in proposals:
-        t = p[0]
-        k = table_key(p)
-        if prop_count.get(t, 0) < maxadd:
-            prop_by_key[k] = p
-            prop_count[t] = prop_count.get(t, 0) + 1
+        t = p[0][0]
+        if count.get(t, 0) < maxadd:
+            chosen[entry_key(*p)] = p
+            count[t] = count.get(t, 0) + 1
 
-    matched = set()
     new_entries = []
-
-    for fields in table_entries:
-        if len(fields) < 4:
-            continue
-        t  = fields[0]
-        si = sigma_index(fields)
-        # Escalate sigma 1%
-        sig = float(fields[si]) * 1.01
-        # Drop loose nonbond/bond
-        if t in ("NONBOND","BOND") and sig >= 5.0:
-            continue
+    in_table = set()
+    for fields, attrs in table_entries:
+        fields = list(fields)
+        k   = entry_key(fields, attrs)
+        t   = fields[0]
+        si  = sigma_index(fields)
+        sig = float(fields[si])
+        in_table.add(k)
+        if k in chosen:
+            sig = tighten(fields, sig)
+        else:
+            # Relax; drop loose nonbond/bond
+            sig *= 1.01
+            if t in ("NONBOND","BOND") and sig >= 5.0:
+                continue
         fields[si] = f"{sig:.6f}"
-        k = table_key(fields)
-        if k in prop_by_key:
-            floor = {"ANGLE": 0.5, "TORSION": 5.0}.get(t, 0.001)
-            sig = max(sig / 1.5, floor)
-            fields[si] = f"{sig:.6f}"
-            matched.add(k)
-        new_entries.append(fields)
+        new_entries.append((fields, attrs))
+    ntightened = len(in_table & chosen.keys())
 
-    # Add new proposals not yet in table
-    for k, p in prop_by_key.items():
-        if k not in matched:
-            new_entries.append(p)
+    # Add new proposals not yet in table.  Only NONBOND adds a restraint; the
+    # others change an existing one, so start them one step tighter than
+    # natural or the change does nothing.
+    nadded = 0
+    for k, (fields, attrs) in chosen.items():
+        if k not in in_table:
+            fields = list(fields)
+            if fields[0] != "NONBOND":
+                si = sigma_index(fields)
+                fields[si] = f"{tighten(fields, float(fields[si])):.6f}"
+            new_entries.append((fields, attrs))
+            nadded += 1
 
-    return new_entries
+    return new_entries, ntightened, nadded
 
 def write_table(entries, table_path):
-    with open(table_path + ".bak", "w") as f:
-        pass  # backup will be overwritten by shutil.copy below
     if os.path.exists(table_path):
         shutil.copy(table_path, table_path + ".bak")
     with open(table_path, "w") as f:
-        for fields in entries:
-            f.write(" ".join(str(x) for x in fields) + "\n")
+        for fields, attrs in entries:
+            words = list(fields) + [f"{k}={v}" for k, v in attrs.items()]
+            f.write(" ".join(words) + "\n")
 
 # ---------------------------------------------------------------------------
 # Step 3: Convert table to phenix_fudge.eff
@@ -348,22 +400,26 @@ def asel(c, r, a, f):
         s += f" and altid {f}"
     return s
 
-def write_phenix(entries, outfile):
+def write_phenix(entries, outfile, dihedrals=frozenset()):
     lines = ["refinement {", "  geometry_restraints.edits {"]
 
-    for fields in entries:
+    for fields, attrs in entries:
         t = fields[0]
 
         if t == "NONBOND":
             c1,r1,a1,f1 = fields[1],fields[2],fields[3],fields[4]
             c2,r2,a2,f2 = fields[5],fields[6],fields[7],fields[8]
             dmin  = float(fields[9])
-            sigma = float(fields[10])
+            sigma = max(float(fields[10]), 0.001)
             lines += [
                 "    bond {",
                 "      action = *add",
                 f'      atom_selection_1 = "{asel(c1,r1,a1,f1)}"',
                 f'      atom_selection_2 = "{asel(c2,r2,a2,f2)}"',
+            ]
+            if attrs.get("sym"):
+                lines += [f"      symmetry_operation = {attrs['sym']}"]
+            lines += [
                 f"      distance_ideal = {dmin+1:.4f}",
                 f"      sigma = {sigma:.6f}",
                 "      slack = 1",
@@ -373,7 +429,7 @@ def write_phenix(entries, outfile):
         elif t == "BOND":
             c1,r1,a1,f1 = fields[1],fields[2],fields[3],fields[4]
             c2,r2,a2,f2 = fields[5],fields[6],fields[7],fields[8]
-            value = float(fields[9]); sigma = float(fields[10])
+            value = float(fields[9]); sigma = max(float(fields[10]), 0.001)
             lines += [
                 "    bond {",
                 "      action = *change",
@@ -388,7 +444,7 @@ def write_phenix(entries, outfile):
             c1,r1,a1,f1 = fields[1],fields[2],fields[3],fields[4]
             c2,r2,a2,f2 = fields[5],fields[6],fields[7],fields[8]
             c3,r3,a3,f3 = fields[9],fields[10],fields[11],fields[12]
-            value = float(fields[13]); sigma = float(fields[14])
+            value = float(fields[13]); sigma = max(float(fields[14]), 0.001)
             lines += [
                 "    angle {",
                 "      action = *change",
@@ -406,21 +462,26 @@ def write_phenix(entries, outfile):
             c3,r3,a3,f3 = fields[9],fields[10],fields[11],fields[12]
             c4,r4,a4,f4 = fields[13],fields[14],fields[15],fields[16]
             value  = float(fields[17])
-            sigma  = float(fields[18])
+            sigma  = max(float(fields[18]), 0.001)
+            # change a dihedral phenix already has (it refuses a duplicate add);
+            # periodicity 0 = harmonic (phenix's default of 1 is sinusoidal)
+            quad = ((c1,r1,a1,f1), (c2,r2,a2,f2), (c3,r3,a3,f3), (c4,r4,a4,f4))
+            action = "change" if (quad in dihedrals or quad[::-1] in dihedrals) else "add"
             lines += [
                 "    dihedral {",
-                "      action = *add",
+                f"      action = *{action}",
                 f'      atom_selection_1 = "{asel(c1,r1,a1,f1)}"',
                 f'      atom_selection_2 = "{asel(c2,r2,a2,f2)}"',
                 f'      atom_selection_3 = "{asel(c3,r3,a3,f3)}"',
                 f'      atom_selection_4 = "{asel(c4,r4,a4,f4)}"',
                 f"      angle_ideal = {value:.4f}",
                 f"      sigma = {sigma:.6f}",
+                f"      periodicity = {fields[19]}",
                 "    }",
             ]
 
         elif t == "PLANE":
-            sigma = float(fields[1])
+            sigma = max(float(fields[1]), 0.001)
             atom_fields = fields[2:]
             atom_sels = []
             for i in range(0, len(atom_fields)-3, 4):
@@ -449,14 +510,15 @@ def main():
         print(f"ERROR: fullgeo file not found: {args.fullgeo}", file=sys.stderr)
         sys.exit(1)
 
-    proposals     = extract_proposals(args.fullgeo, args.sigma_fudge,
-                                       args.geo, args.cbetadev, args.overridefile)
-    table_entries = load_table(args.table)
-    new_entries   = accumulate(proposals, table_entries, args.maxadd)
-    write_table(new_entries, args.table)
-    write_phenix(new_entries, args.outfile)
+    proposals = extract_proposals(args.fullgeo, args.sigma_fudge,
+                                  args.geo, args.cbetadev, args.overridefile)
+    new_entries, ntightened, nadded = accumulate(proposals, load_table(args.table), args.maxadd)
 
-    print(f"fudgeify: wrote {args.outfile} from {args.fullgeo} ({len(new_entries)} table entries)")
+    write_table(new_entries, args.table)
+    write_phenix(new_entries, args.outfile, load_dihedrals(args.geo))
+
+    print(f"fudgeify: wrote {args.outfile} from {args.fullgeo} ({len(new_entries)} table entries,"
+          f" {nadded} added, {ntightened} tightened)")
 
 if __name__ == "__main__":
     main()
