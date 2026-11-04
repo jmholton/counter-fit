@@ -30,6 +30,7 @@ cat >! ${tmpdir}/find_ss.awk << EOF
 /^ATOM|^HETAT/ {
   if (\$3 != "SG") next
   alt = substr(\$0,17,1)
+  if (alt == " ") alt = "_"
   res = substr(\$0,18,3)
   ch  = substr(\$0,22,1)
   rn  = substr(\$0,23,4) + 0
@@ -44,9 +45,8 @@ END {
       d = sqrt((x[i]-x[j])^2 + (y[i]-y[j])^2 + (z[i]-z[j])^2)
       if (d >= 1.8 && d <= 2.6) {
         ai = altid[i]; aj = altid[j]
-        if (ai == "" || aj == "" || ai == aj) {
-          printf "%s %s %s %s %s %s\n", chain[i], resnum[i], (ai==""?" ":ai), \
-                                         chain[j], resnum[j], (aj==""?" ":aj)
+        if (ai == "_" || aj == "_" || ai == aj) {
+          printf "%s %s %s %s %s %s\n", chain[i], resnum[i], ai, chain[j], resnum[j], aj
         }
       }
     }
@@ -117,15 +117,16 @@ EOF
 # ---- Write ss_link.eff ----
 echo "refinement.pdb_interpretation {" >! ss_link.eff
 
-# awk script to generate apply_cif_link blocks
+# awk script to generate apply_cif_link blocks: one per residue pair, since
+# phenix links every conformer of the selected residues (a link per altloc
+# makes duplicate SG-SG bonds)
 cat >! ${tmpdir}/gen_eff.awk << EOF
 {
-  ch1=\$1; rn1=\$2; al1=\$3
-  ch2=\$4; rn2=\$5; al2=\$6
+  ch1=\$1; rn1=\$2
+  ch2=\$4; rn2=\$5
+  if (++done[ch1 " " rn1 " " ch2 " " rn2] > 1) next
   sel1 = "chain " ch1 " and resname CYS and resseq " rn1
   sel2 = "chain " ch2 " and resname CYS and resseq " rn2
-  if (al1 != " " && al1 != ch1) sel1 = sel1 " and altid " al1
-  if (al2 != " " && al2 != ch2) sel2 = sel2 " and altid " al2
   print "  apply_cif_link {"
   print "    data_link = NEW_SS"
   print "    residue_selection_1 = " sel1

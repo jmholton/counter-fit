@@ -36,8 +36,12 @@ ground_factory_runme.com  model.pdb  data.mtz  [options]
   snap_wxc=1.0       wxc_scale for snap iterations
   fudgeify=0         if 1, use fudgeify.py instead of reweight_opts for
                      phenix_fudge.eff (recommended for new runs)
+  crowbars=N         with fudgeify, clashes and contacts crowbarred per cycle,
+                     each (default maxadd; 0 = no crowbars)
   cdl=False          phenix conformation-dependent library, in refinement and
                      in molprobify scoring (CDL undoes backbone bond edits)
+  fixweights=1       fix phenix's X-ray weights at iteration 001's values
+                     (see below); 0 = phenix recomputes them every macro-cycle
   overrides=file     TORSION OVERRIDE file — genuine outliers that must not
                      be tightened (see OVERRIDE policy below)
 ```
@@ -54,6 +58,7 @@ ground_factory_runme.com  model.pdb  data.mtz  [options]
 | `fudge_table.txt` | fudgeify state: sigma history across cycles |
 | `start_NNN_crowbars.txt` | contacts each crowbar switches off or weakens in phenix |
 | `ground_factory.lock` | host and PID of the run using this directory |
+| `fixed_weights.txt` | wxc and wxu from iteration 001, unscaled |
 | `fmodelme.pdb` | final model after REFMAC B-factor convergence |
 | `nonoise.mtz` / `simplenoise.mtz` | ideal / ~3%-noisy structure factors, at the resolution of the input mtz |
 
@@ -70,6 +75,17 @@ ground_factory_runme.com  model.pdb  data.mtz  [options]
 
 The loop stops at `maxcycles`, or when phenix, molprobify or fudgeify fails.
 The final REFMAC step starts from the last iteration.
+
+**X-ray weights.**  phenix normally recomputes its X-ray weights (wxc, wxu)
+every macro-cycle from gradient norms, and a new or tightened restraint can
+change them more than tenfold from one iteration to the next (7KR0: wxc 23 →
+334), which undoes the down-weighting.  With `fixweights=1` they are fixed
+at their averages over iteration 001's macro-cycles (in `fixed_weights.txt`),
+and every later iteration passes `fix_wxc = wxc × wxc_scale` (phenix ignores
+`wxc_scale` once wxc is fixed) and `fix_wxu = wxu` (phenix still applies
+`wxu_scale`).  phenix's default target is least-squares for the first two
+macro-cycles and ml after, with weights ~10× apart, so every iteration uses
+`main.target=ml`.
 
 ---
 
@@ -148,16 +164,17 @@ cycle:
 
 | Event | Action |
 |-------|--------|
-| One of the worst `maxadd` outliers of its type, not yet in the table | Add: a crowbar at sigma 0.4; BOND/ANGLE/TORSION at natural sigma/1.5 (they change phenix's own restraint, so natural sigma would change nothing) |
+| One of the worst `maxadd` outliers of its type, not yet in the table | Add: a crowbar at sigma 0.4; a plane at phenix's sigma (it is a second restraint); BOND/ANGLE/TORSION at natural sigma/1.5 (they change phenix's own restraint, so natural sigma would change nothing) |
 | One of the worst `maxadd` outliers of its type, already in the table | Tighten: `sigma /= 1.5`, down to the floors (crowbar 0.01, BOND 0.001, ANGLE and TORSION 0.01) |
 | A crowbar chosen again at its floor | Lengthen: `dmin += 0.1` |
 | Anything else in the table | Relax: `sigma *= 1.01` |
-| NONBOND or BOND sigma ≥ 5 | Drop (restraint resolved) |
+| NONBOND, BOND or PLANE sigma ≥ 5 | Drop (restraint resolved) |
 
 **Crowbars** (NONBOND entries) push contacts apart: a phenix bond that only
 pushes, flat from `dmin` out to `dmin+2` (`distance_ideal = dmin+1`,
 `slack = 1`).  Probe clashes and scored contacts (fullgeo `NONBOND` lines)
-are two separate lists, each giving its worst `maxadd` per cycle.  A
+are two separate lists, each giving its worst `crowbars` per cycle (default
+`maxadd`).  A
 hydrogen is replaced by its parent heavy atom, since crowbarring a hydrogen
 only bends it, and `dmin` is the parents' contact distance plus the overlap
 (plus 0.1 Å per hydrogen replaced, for scored contacts).  Parents that
@@ -171,6 +188,17 @@ weakens the next shell (1-4, vdW × 0.8).  They are still scored.  Each cycle
 current distance and the contact distance, and the log counts how many are
 now too close.  Lengthening has no limit, so a contact that never resolves
 keeps getting longer; that file shows it.
+
+**Planes.**  fullgeo lists plane deviations per atom without saying which
+plane, so fudgeify measures every phenix plane (from `default.geo`) in the
+model (`<prefix>.pdb`); a plane is out when an atom is out of it both there
+and in the fullgeo score (so overrides apply).  The worst `maxadd` get a
+second planarity restraint on the plane's heavy atoms.  phenix refuses a
+plane with the same atoms as one of its own, so such a copy drops its
+best-fitting atom, and a 4-atom one (a peptide's CA, C, O, N) is restrained
+instead by an improper dihedral on the same 4 atoms (0 or 180°, sigma =
+the plane's sigma over the 4th atom's distance from the dihedral axis, in
+degrees), which is the only way 4 atoms leave a plane.
 
 Bond changes need phenix's conformation-dependent library off, which is
 ground_factory's default (`cdl=False`).  CDL sets the C–N, N–CA, CA–CB, CA–C
@@ -190,9 +218,10 @@ are skipped (exact atom match, either direction).
 **Usage**
 
 ```
-python3 fudgeify.py  start_006_fullgeo.txt  [maxadd=1]  [outfile=phenix_fudge.eff]
+python3 fudgeify.py  start_006_fullgeo.txt  [maxadd=1]  [crowbars=1]  [outfile=phenix_fudge.eff]
                      [table=fudge_table.txt]  [overridefile=overrides.txt]
                      [clashes=start_006_clashes.txt]  [watch=start_006_crowbars.txt]
+                     [pdb=start_006.pdb]  [geo=default.geo]
 ```
 
 Key-value arguments (`key=val`) are accepted alongside normal flags.
@@ -212,7 +241,7 @@ default 104.2°).  Uses `apply_cif_link` because
 
 | File | Created by | Purpose |
 |------|-----------|---------|
-| `noocc.eff` | ground_factory (first run) | Disable occupancy refinement; generate R-free flags |
+| `noocc.eff` | ground_factory (first run) | Disable occupancy refinement; isotropic B for every non-hydrogen atom (phenix refuses riding H in the selection); generate R-free flags |
 | `ss_link.cif/eff` | make_ss_link | SS-bond geometry (if SS bonds present) |
 | `default.geo` | phenix iteration 001 | Reference geometry for redo_harmonics |
 | `fudge_table.txt` | fudgeify | Sigma state across cycles |
@@ -243,9 +272,9 @@ dead on another host.
   `tcsh script.com`, so the shebang is honoured.
 - MTZ files without R-free flags are handled automatically
   (`data_manager.fmodel.xray_data.r_free_flags.generate = True` in `noocc.eff`).
-- Phenix planarity restraints via `geometry_restraints.edits` are unreliable
-  for peptide planes; plane corrections go through REFMAC
-  `extern plane` entries instead.
+- phenix refuses a planarity edit with the same atoms as one of its own
+  planes (such as the peptide's CA, C, O, N).  reweight_opts skips those;
+  fudgeify restrains them with an improper dihedral instead.
 - OVERRIDE policy: `overrides.txt` is populated only at the beginning, from
   obvious outliers in obviously good density.  Nothing adds to it during a
   run.

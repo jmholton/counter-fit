@@ -14,9 +14,9 @@ backbone bonds only take effect with phenix's CDL off (ground_factory
 cdl=False): CDL rewrites them every macro-cycle.
 
 Contacts get crowbars (NONBOND entries): a bond that only pushes, from dmin
-out to dmin+2 (distance_ideal dmin+1, slack 1).  The worst maxadd probe
-clashes (<prefix>_clashes.txt) and the worst maxadd scored contacts (fullgeo
-NONBOND lines) are chosen separately.  A hydrogen is replaced by its parent
+out to dmin+2 (distance_ideal dmin+1, slack 1).  The worst probe clashes
+(<prefix>_clashes.txt) and the worst scored contacts (fullgeo NONBOND
+lines) are chosen separately, crowbars=N of each per cycle (default maxadd).  A hydrogen is replaced by its parent
 heavy atom, since crowbarring a hydrogen only bends it, and dmin is the
 parents' contact distance plus the overlap (plus 0.1 per hydrogen replaced,
 for scored contacts).  Parents that phenix does not treat as a contact
@@ -28,6 +28,14 @@ phenix puts a crowbar in its bond graph, so the contacts between each
 crowbar atom and the other atom's bonded neighbours (1-3) are switched off,
 and the next shell (1-4) is scaled down.  Those contacts are still scored;
 each cycle they are listed under their crowbar in <prefix>_crowbars.txt.
+
+Planes out of plane get a second planarity restraint (PLANE entries), on the
+heavy atoms of phenix's plane (default.geo), measured in the model
+(<prefix>.pdb).  phenix refuses a plane it already has, so a heavy-atom copy
+of one of its own planes drops its best-fitting atom; a 4-atom copy (a
+peptide's CA, C, O, N) is restrained instead by an improper dihedral on the
+same 4 atoms (a TORSION entry), which is the one way 4 atoms leave a plane.
+Like crowbars, they add a restraint, so they start at phenix's sigma.
 
 Table format (fudge_table.txt):
   NONBOND  C1 R1 A1 F1  C2 R2 A2 F2  dmin sigma
@@ -44,6 +52,7 @@ Atom fields: C=chain, R=resi, A=atomname, F=altid  ("_" = blank)
 import sys
 import os
 import re
+import math
 import shutil
 import argparse
 from fractions import Fraction
@@ -58,6 +67,8 @@ def parse_args():
     p.add_argument("fullgeo", help="fullgeo file from molprobify")
     p.add_argument("--table",       default="fudge_table.txt")
     p.add_argument("--maxadd",      type=int,   default=1)
+    p.add_argument("--crowbars",    type=int,   default=-1,
+                   help="clashes and contacts crowbarred per cycle, each (default maxadd)")
     p.add_argument("--sigma_fudge", type=float, default=1.0)
     p.add_argument("--outfile",     default="phenix_fudge.eff")
     p.add_argument("--geo",         default="default.geo")
@@ -65,6 +76,7 @@ def parse_args():
     p.add_argument("--overridefile",default="")
     p.add_argument("--clashes",     default="", help="probe clashes (default <prefix>_clashes.txt)")
     p.add_argument("--watch",       default="", help="crowbar side effects (default <prefix>_crowbars.txt)")
+    p.add_argument("--pdb",         default="", help="model, for plane deviations (default <prefix>.pdb)")
 
     # Accept "key=val" positional arguments in tcsh style
     argv_clean = []
@@ -306,12 +318,155 @@ def extract_proposals(fullgeo_path, sigma_fudge, geo_path="", cbetadev_path="", 
                     proposals.append((["TORSION", c,r,desc,alt, c,r,("C" if desc=="N" else "N"),alt,
                                        c,r,"CA",alt, c,r,"CB",alt, f"{v:.4f}", "2.5", "0"], {}))
 
-    # PLANE from .geo file (only first atom per plane given in fullgeo, so skip for now unless geo provided)
-    # geo parsing is complex; stub for future implementation
-    if geo_path and os.path.exists(geo_path):
-        pass  # TODO: parse phenix .geo plane records
-
     return proposals
+
+# ---------------------------------------------------------------------------
+# Planes
+# ---------------------------------------------------------------------------
+
+def load_planes(geo_path):
+    """Every planarity phenix restrains, from a phenix.refine .geo file, as
+    lists of ((C, R, A, F), sigma)."""
+    planes, cur = [], None
+    if not geo_path or not os.path.exists(geo_path):
+        return planes
+    with open(geo_path) as f:
+        for line in f:
+            if line.startswith("plane pdb="):
+                cur = []
+                planes.append(cur)
+            elif cur is None or not line.startswith("      pdb="):
+                cur = None
+                continue
+            w = line.split('"')
+            pid = w[1]
+            cur.append(((blank(pid[9]), pid[10:15].strip(), pid[0:4].strip(), blank(pid[4])),
+                        float(w[2].split()[1])))
+    return planes
+
+def load_sites(pdb_path):
+    """Coordinates of each atom (C, R, A, F) in a PDB file."""
+    sites = {}
+    with open(pdb_path) as f:
+        for line in f:
+            if line.startswith(("ATOM", "HETATM")):
+                atom = (blank(line[21]), line[22:27].strip(), line[12:16].strip(), blank(line[16]))
+                sites[atom] = tuple(float(line[i:i+8]) for i in (30, 38, 46))
+    return sites
+
+def sub(a, b):
+    return [x - y for x, y in zip(a, b)]
+
+def dot(a, b):
+    return sum(x * y for x, y in zip(a, b))
+
+def cross(a, b):
+    return [a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0]]
+
+def smallest_eigenvector(m):
+    """Unit eigenvector of the smallest eigenvalue of a symmetric 3x3 matrix,
+    by Jacobi rotations."""
+    a = [list(row) for row in m]
+    v = [[float(i == j) for j in range(3)] for i in range(3)]
+    for sweep in range(50):
+        if sum(a[i][j]**2 for i in range(3) for j in range(3) if i != j) < 1e-30:
+            break
+        for p in range(2):
+            for q in range(p + 1, 3):
+                if a[p][q] == 0:
+                    continue
+                theta = (a[q][q] - a[p][p]) / (2 * a[p][q])
+                t = (1 if theta >= 0 else -1) / (abs(theta) + math.sqrt(theta*theta + 1))
+                c = 1 / math.sqrt(t*t + 1)
+                s = t * c
+                for k in range(3):
+                    a[k][p], a[k][q] = c*a[k][p] - s*a[k][q], s*a[k][p] + c*a[k][q]
+                for k in range(3):
+                    a[p][k], a[q][k] = c*a[p][k] - s*a[q][k], s*a[p][k] + c*a[q][k]
+                for k in range(3):
+                    v[k][p], v[k][q] = c*v[k][p] - s*v[k][q], s*v[k][p] + c*v[k][q]
+    i = min(range(3), key=lambda i: a[i][i])
+    return [v[k][i] for k in range(3)]
+
+def plane_deviations(xyz, weights):
+    """Distance of each site from the weighted least-squares plane, as phenix
+    computes it."""
+    w = sum(weights)
+    centre = [sum(wi * p[k] for wi, p in zip(weights, xyz)) / w for k in range(3)]
+    d = [sub(p, centre) for p in xyz]
+    m = [[sum(wi * di[r] * di[c] for wi, di in zip(weights, d)) for c in range(3)] for r in range(3)]
+    n = smallest_eigenvector(m)
+    return [dot(di, n) for di in d]
+
+def dihedral(p1, p2, p3, p4):
+    b1, b2, b3 = sub(p2, p1), sub(p3, p2), sub(p4, p3)
+    n1, n2 = cross(b1, b2), cross(b2, b3)
+    m = cross(n1, [x / math.sqrt(dot(b2, b2)) for x in b2])
+    return math.degrees(math.atan2(dot(m, n2), dot(n1, n2)))
+
+def plane_proposals(fullgeo_path, planes, sites, neighbours, dihedrals, threshold):
+    """Restraints for the planes whose atoms are out of plane, worst first.
+
+    An atom is out of plane when both its score in fullgeo (after overrides)
+    and its distance from the plane, measured here, exceed threshold: fullgeo
+    does not say which of an atom's planes it is out of.  Planes are ranked
+    by the fullgeo score, since molprobify scores its own hydrogens, which
+    can move a plane's fit away from the one measured here.  The restraint is
+    the plane's heavy atoms.  phenix refuses a plane it already has, so a
+    copy of one of its own planes loses its best-fitting atom; a 4-atom copy
+    (a peptide's CA, C, O, N) has one way out of plane, and the same 4 atoms
+    are restrained by an improper dihedral instead: 0 or 180 degrees, sigma
+    the plane's sigma over the 4th atom's distance from the dihedral axis.
+    """
+    scored = {}
+    with open(fullgeo_path) as f:
+        for line in f:
+            if not line.startswith("PLANE") or "|" not in line:
+                continue
+            head, pipe = line.split("|", 1)
+            try:
+                energy = float(head.split()[1])
+            except (IndexError, ValueError):
+                continue
+            atoms = parse_atom_specs(pipe)
+            if atoms:
+                scored[atoms[0]] = max(energy, scored.get(atoms[0], 0.0))
+
+    own = {frozenset(a for a, s in plane) for plane in planes}
+    found = []
+    for plane in planes:
+        atoms = [a for a, s in plane]
+        if not all(a in sites for a in atoms):
+            continue
+        sigma = min(s for a, s in plane)
+        dev = plane_deviations([sites[a] for a in atoms], [1 / s**2 for a, s in plane])
+        energy = {a: scored.get(a, 0.0) if (d / s)**2 > threshold else 0.0
+                  for (a, s), d in zip(plane, dev)}
+        heavy = [a for a in atoms if is_heavy(a[2])]
+        worst = max((energy[a] for a in heavy), default=0.0)
+        if worst <= threshold or len(heavy) < 4:
+            continue
+        if frozenset(heavy) in own and len(heavy) > 4:
+            heavy.remove(min(heavy, key=lambda a: abs(dev[atoms.index(a)])))
+        if frozenset(heavy) not in own:
+            fields = ["PLANE", f"{sigma:.6f}"] + [x for a in sorted(heavy) for x in a]
+        elif len(heavy) == 4:
+            # improper: the atom bonded to the other three goes last
+            quad = tuple(sorted(heavy, key=lambda a: len(neighbours.get(a, set()) & set(heavy))))
+            if quad in dihedrals or quad[::-1] in dihedrals:
+                continue
+            xyz = [sites[a] for a in quad]
+            axis = sub(xyz[2], xyz[1])
+            arm = sub(xyz[3], xyz[1])
+            h = math.sqrt(dot(cross(axis, arm), cross(axis, arm)) / dot(axis, axis))
+            ideal = 0.0 if abs(dihedral(*xyz)) < 90 else 180.0
+            fields = (["TORSION"] + [x for a in quad for x in a] +
+                      [f"{ideal:.4f}", f"{math.degrees(sigma / h):.6f}", "0"])
+        else:
+            continue
+        found.append((worst, (fields, {"_via": "PLANE"})))
+    found.sort(key=lambda e: -e[0])
+    return [p for worst, p in found]
 
 # ---------------------------------------------------------------------------
 # Crowbars: restraints that push contacts apart
@@ -537,18 +692,22 @@ def tighten(fields, sig):
     """sigma/1.5, not below the floor for its type, and never looser."""
     return max(sig / 1.5, min(sig, FLOORS.get(fields[0], 0.001)))
 
-def accumulate(proposals, table_entries, maxadd):
-    """Tighten or add the worst maxadd proposals of each type; relax the rest 1%.
+def accumulate(proposals, table_entries, maxadd, ncrowbars=None):
+    """Tighten or add the worst maxadd proposals of each type, and the worst
+    ncrowbars (default maxadd) of each crowbar list; relax the rest 1%.
     A crowbar tightened past its floor is lengthened instead.
 
     Returns the new entries and how many were tightened, lengthened and added.
     """
+    if ncrowbars is None:
+        ncrowbars = maxadd
     chosen = {}
     count  = {}
     for p in proposals:
-        t = p[1].get("_via", p[0][0])     # crowbars: clash or contact list
+        t = p[1].get("_via", p[0][0])     # crowbars: clash or contact list; planes
+        limit = ncrowbars if t in ("CLASH", "NONBOND") else maxadd
         k = entry_key(*p)
-        if count.get(t, 0) < maxadd and k not in chosen:
+        if count.get(t, 0) < limit and k not in chosen:
             chosen[k] = p
             count[t] = count.get(t, 0) + 1
 
@@ -568,23 +727,24 @@ def accumulate(proposals, table_entries, maxadd):
                 nlengthened += 1
             sig = tighten(fields, sig)
         else:
-            # Relax; drop loose nonbond/bond
+            # Relax; drop loose nonbond/bond/plane
             sig *= 1.01
-            if t in ("NONBOND","BOND") and sig >= 5.0:
+            if t in ("NONBOND","BOND","PLANE") and sig >= 5.0:
                 continue
         fields[si] = f"{sig:.6f}"
         new_entries.append((fields, attrs))
     ntightened = len(in_table & chosen.keys())
 
-    # Add new proposals not yet in table.  Only NONBOND adds a restraint; the
-    # others change an existing one, so start them one step tighter than
+    # Add new proposals not yet in table.  Crowbars and planes add a restraint;
+    # the others change an existing one, so start them one step tighter than
     # natural or the change does nothing.
     nadded = 0
     for k, (fields, attrs) in chosen.items():
         if k not in in_table:
             fields = list(fields)
+            adds = attrs.get("_via") in ("CLASH", "NONBOND", "PLANE")
             attrs = {a: v for a, v in attrs.items() if not a.startswith("_")}
-            if fields[0] != "NONBOND":
+            if not adds:
                 si = sigma_index(fields)
                 fields[si] = f"{tighten(fields, float(fields[si])):.6f}"
             new_entries.append((fields, attrs))
@@ -725,15 +885,23 @@ def main():
     prefix = re.sub(r"_fullgeo\.txt$", "", args.fullgeo)
 
     neighbours, contacts = load_geometry(args.fullgeo)
+    dihedrals = load_dihedrals(args.geo)
     proposals = extract_proposals(args.fullgeo, args.sigma_fudge,
                                   args.geo, args.cbetadev, args.overridefile)
     proposals += crowbar_proposals(neighbours, contacts,
                                    args.clashes or prefix + "_clashes.txt", args.sigma_fudge)
+    pdb = args.pdb or prefix + ".pdb"
+    if os.path.exists(pdb):
+        proposals += plane_proposals(args.fullgeo, load_planes(args.geo), load_sites(pdb),
+                                     neighbours, dihedrals, args.sigma_fudge)
+    else:
+        print(f"fudgeify: no {pdb}, so no planes", file=sys.stderr)
+    ncrowbars = args.crowbars if args.crowbars >= 0 else args.maxadd
     new_entries, ntightened, nlengthened, nadded = accumulate(proposals, load_table(args.table),
-                                                             args.maxadd)
+                                                             args.maxadd, ncrowbars)
 
     write_table(new_entries, args.table)
-    write_phenix(new_entries, args.outfile, load_dihedrals(args.geo))
+    write_phenix(new_entries, args.outfile, dihedrals)
     listed, close = watch_crowbars(new_entries, neighbours, contacts,
                                    args.watch or prefix + "_crowbars.txt", args.sigma_fudge)
 

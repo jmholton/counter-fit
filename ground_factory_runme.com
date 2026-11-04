@@ -25,9 +25,15 @@
 #     snap_interval=0    if >0, run a snap iteration every N cycles (default 0=off)
 #     snap_wxc=1.0       wxc_scale used during snap iterations (default 1.0)
 #     fudgeify=0         if 1, fudgeify.py writes phenix_fudge.eff instead of reweight_opts
-#     cdl=False          phenix conformation-dependent library, in refinement and
+#     crowbars=N         with fudgeify, clashes and contacts crowbarred per cycle,
+#                        each (default maxadd)
+#     cdl=False         phenix conformation-dependent library, in refinement and
 #                        in molprobify scoring.  CDL rewrites backbone bond
 #                        restraints every macro-cycle, undoing edits to them
+#     fixweights=1       phenix's X-ray weights wxc and wxu fixed at their
+#                        averages in iteration 001 (then scaled by wxc and wxu),
+#                        with the ml target in every macro-cycle; 0 = phenix
+#                        recomputes them every macro-cycle
 #
 #   Outputs:
 #     start_NNN.pdb    phenix-refined model each iteration
@@ -50,7 +56,9 @@ set propagate     = 0
 set snap_interval = 0
 set snap_wxc      = 1.0
 set fudgeify      = 0
+set crowbars      = ""
 set cdl           = False
+set fixweights    = 1
 
 foreach Arg ( $* )
   set key = `echo $Arg | awk -F= '{print $1}'`
@@ -68,8 +76,11 @@ foreach Arg ( $* )
   if("$key" == "snap_interval") set snap_interval = $val
   if("$key" == "snap_wxc")      set snap_wxc      = $val
   if("$key" == "fudgeify")      set fudgeify      = $val
+  if("$key" == "crowbars")      set crowbars      = $val
   if("$key" == "cdl")           set cdl           = $val
+  if("$key" == "fixweights")    set fixweights    = $val
 end
+if("$crowbars" == "") set crowbars = $maxadd
 
 if("$pdbfile" == "" || "$mtzfile" == "") then
   echo "Usage: ground_factory_runme.com model.pdb data.mtz [options]"
@@ -99,6 +110,12 @@ echo "$thishost $$" >! ground_factory.lock
 
 set PHENIXRUN = "phenix.refine"
 if($srun) set PHENIXRUN = "srun -p debug phenix.refine"
+
+# phenix's default target is least-squares for the first two macro-cycles and
+# ml after, and its weights differ ~10x between them, so one fixed weight
+# needs one target
+set targetarg = ""
+if($fixweights) set targetarg = "main.target=ml"
 
 # -----------------------------------------------------------------------
 # Step 1: SS bonds
@@ -135,6 +152,11 @@ refinement {
     strategy = *individual_sites individual_sites_real_space rigid_body \
                *individual_adp group_adp tls occupancies group_anomalous den
     occupancies { remove_selection = All }
+    adp {
+      individual {
+        isotropic = not (element H or element D)
+      }
+    }
   }
   geometry_restraints.edits {
     excessive_bond_distance_limit = 100
@@ -171,7 +193,7 @@ if(! -e default.geo) then
   $PHENIXRUN $pdbfile $mtzfile \
     prefix=${prefix} serial=001 \
     $ssargs noocc.eff \
-    wxc_scale=${wxc} wxu_scale=${wxu} \
+    wxc_scale=${wxc} wxu_scale=${wxu} $targetarg \
     main.number_of_macro_cycles=5 cdl=${cdl} \
     write_geo_file=True \
     phenix_holdme.eff phenix_fudge.eff >! phenix_001.log
@@ -180,6 +202,21 @@ if(! -e default.geo) then
     exit 1
   endif
   cp ${prefix}_001.geo default.geo
+endif
+
+# X-ray weights phenix chose in iteration 001, averaged over its ml
+# macro-cycles: "wxc wxu", unscaled
+awk '/using refinement target/{t=$NF}\
+     /\| wxc = /{ac+=$4;++nac; if(t=="ml"){c+=$4;++nc}}\
+     /\| wxu = /{au+=$4;++nau; if(t=="ml"){u+=$4;++nu}}\
+     END{if(nc && nu) print c/nc, u/nu; else if(nac && nau) print ac/nac, au/nau}' \
+  ${prefix}_001.log >! fixed_weights.txt
+if($fixweights) then
+  if(! -s fixed_weights.txt) then
+    echo "ERROR: no wxc and wxu in ${prefix}_001.log to fix the weights at"
+    exit 1
+  endif
+  echo "fixed weights from iteration 001: wxc wxu = `cat fixed_weights.txt`"
 endif
 
 # -----------------------------------------------------------------------
@@ -220,10 +257,14 @@ foreach x ( `seq 1 $maxcycles` )
   # Skip if this iteration's output already exists
   if(-e ${prefix}_${num}.pdb) goto already_done
 
+  # phenix ignores wxc_scale when wxc is fixed, but still applies wxu_scale
+  set weightargs = ""
+  if($fixweights) set weightargs = `awk -v s=$wxc_now '{print "target_weights.fix_wxc=" $1*s, "target_weights.fix_wxu=" $2}' fixed_weights.txt`
+
   $PHENIXRUN $startpdb $mtzfile \
     prefix=${prefix} serial=${num} \
     $ssargs noocc.eff \
-    wxc_scale=${wxc_now} wxu_scale=${wxu} \
+    wxc_scale=${wxc_now} wxu_scale=${wxu} $targetarg $weightargs \
     main.number_of_macro_cycles=5 cdl=${cdl} \
     write_geo_file=True \
     phenix_holdme.eff phenix_fudge.eff >! phenix_${num}.log
@@ -286,7 +327,7 @@ foreach x ( `seq 1 $maxcycles` )
 
   if($fudgeify) then
     python3 ${scriptdir}/fudgeify.py ${prefix}_${num}_fullgeo.txt \
-      maxadd=$maxadd outfile=phenix_fudge.eff $overridearg
+      maxadd=$maxadd crowbars=$crowbars outfile=phenix_fudge.eff $overridearg
     if($status) then
       echo "ERROR: fudgeify.py failed at iteration $num — stopping"
       break
