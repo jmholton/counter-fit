@@ -41,7 +41,9 @@ endif
 
 foreach reason ( `ls this | awk -F "[_.]" '{print $(NF-1)}'` )
 foreach stage ( start this )
+# a blank altecode would shift the fields
 cat ${stage}/refmac_opts_${reason}.txt |\
+sed 's/altecode  /altecode _ /g; s/altecode *$/altecode _/' |\
 awk '/extern dist/{\
   print $5,$7,$9,$11;\
   print $14,$16,$18,$20}\
@@ -67,8 +69,9 @@ tee hold_these_${reason}.txt
 
 end
 
+# "O  BHOH" carries altloc B; "O   HOH" has none
 rmsd -v debug=1 $startpdb $thispdb |\
- awk '$6>0.1 && /HOH/ && /moved/{print $3,$4,$1,substr($2,1,1)}' |\
+ awk '$6>0.1 && /HOH/ && /moved/{print $3,$4,$1,(length($2)>3 ? substr($2,1,1) : "_")}' |\
 tee -a hold_these_water.txt
 
 sort -u hold_these_*.txt |\
@@ -84,6 +87,21 @@ awk '!($5=="B" && $7=="30" && ($9~/^C[BGDE]/ || $9=="NZ" || $9~/^H[EGDZ]/)) && !
 sort -u previous.txt refmac_opts_holdback.txt |\
 sort -k5,5 -k7,7g |\
 cat >! new_harmonic.txt
+
+# a crowbar (NONBOND in fudge_table.txt) cannot move a pair held at both
+# ends, so release both
+if(-e fudge_table.txt) then
+  awk '$1=="NONBOND"{print "CROWBAR",$2,$3,$4,$5,$6,$7,$8,$9}' fudge_table.txt |\
+  cat - new_harmonic.txt |\
+  awk '/^CROWBAR/{a[++n]=$2" "$3" "$4" "$5; b[n]=$6" "$7" "$8" "$9; next}\
+    {line[++m]=$0; held[$5" "$7" "$9" "$11]=1}\
+    END{for(i=1;i<=n;++i) if(held[a[i]] && held[b[i]]) free[a[i]]=free[b[i]]=1;\
+      for(j=1;j<=m;++j){split(line[j],w," "); if(! free[w[5]" "w[7]" "w[9]" "w[11]]) print line[j]}}' |\
+  cat >! new_harmonic_crowbar.txt
+  set nfree = `cat new_harmonic.txt new_harmonic_crowbar.txt | sort | uniq -u | wc -l`
+  echo "redo_harmonics: released $nfree held atoms at both ends of crowbars"
+  mv new_harmonic_crowbar.txt new_harmonic.txt
+endif
 
 egrep -v "extern harm" refmac_opts.txt >! refmac_opts_new.txt
 cat new_harmonic.txt >> refmac_opts_new.txt
@@ -103,8 +121,9 @@ awk 'BEGIN{\
    printf("      selection = \"");}\
   /extern harmonic/{sigma=$NF;\
      c=$5;r=$7;a=$9;f=$11;\
+     alt=(f=="_" || f=="" ? "" : " and altid " f);\
      ++n;if(n>1)printf("\n        or ");\
-     printf("( name %s and resseq %s and chain %s and altid %s) ",a,r,c,f);\
+     printf("( name %s and resseq %s and chain %s%s) ",a,r,c,alt);\
   }\
   $0=="last"{print "\""}\
   END{\

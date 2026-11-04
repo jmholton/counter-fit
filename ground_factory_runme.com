@@ -244,10 +244,10 @@ foreach x ( `seq 1 $maxcycles` )
   # Propagate: next iteration starts from this iteration's output
   if($propagate) set startpdb = ${prefix}_${num}.pdb
 
+  # writefudge=1 even with fudgeify: redo_harmonics and reweight_opts read
+  # its refmac_opts_*.txt proposals
   set moltempfile = /dev/shm/${USER}/gf_${num}_
-  set molwritefudge = writefudge=1
-  if($fudgeify) set molwritefudge = ""
-  ${scriptdir}/molprobify_runme.com ${prefix}_${num}.pdb keepgeo=1 $molwritefudge debug=1 \
+  ${scriptdir}/molprobify_runme.com ${prefix}_${num}.pdb keepgeo=1 writefudge=1 debug=1 \
     tempfile=${moltempfile} cdl=${cdl} \
     $overridearg | tee molprobify_${num}.log
 

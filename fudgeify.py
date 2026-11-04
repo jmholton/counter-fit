@@ -8,11 +8,26 @@ correction restraints, accumulating sigma-tightening state in fudge_table.txt.
 Each call is one ground_factory cycle: the worst maxadd outliers of each type
 are added or tightened (sigma/1.5, down to the floors reweight_opts uses), and
 every other entry is relaxed (sigma*1.01); NONBOND and BOND entries are
-dropped once relaxed to sigma 5.  A new NONBOND restraint starts at
-0.4/(|delta|+1.1); a new BOND, ANGLE or TORSION entry changes phenix's own
-restraint, so it starts at natural sigma/1.5.  Changes to backbone bonds
-only take effect with phenix's CDL off (ground_factory cdl=False): CDL
-rewrites them every macro-cycle.
+dropped once relaxed to sigma 5.  A new BOND, ANGLE or TORSION entry changes
+phenix's own restraint, so it starts at natural sigma/1.5.  Changes to
+backbone bonds only take effect with phenix's CDL off (ground_factory
+cdl=False): CDL rewrites them every macro-cycle.
+
+Contacts get crowbars (NONBOND entries): a bond that only pushes, from dmin
+out to dmin+2 (distance_ideal dmin+1, slack 1).  The worst maxadd probe
+clashes (<prefix>_clashes.txt) and the worst maxadd scored contacts (fullgeo
+NONBOND lines) are chosen separately.  A hydrogen is replaced by its parent
+heavy atom, since crowbarring a hydrogen only bends it, and dmin is the
+parents' contact distance plus the overlap (plus 0.1 per hydrogen replaced,
+for scored contacts).  Parents that phenix does not treat as a contact
+(bonded or angle neighbours) get no crowbar.  A new crowbar starts at
+sigma 0.4.  A crowbar chosen again once it is at the sigma floor is
+lengthened instead: dmin grows by 0.1 per cycle, as in gf7.
+
+phenix puts a crowbar in its bond graph, so the contacts between each
+crowbar atom and the other atom's bonded neighbours (1-3) are switched off,
+and the next shell (1-4) is scaled down.  Those contacts are still scored;
+each cycle they are listed under their crowbar in <prefix>_crowbars.txt.
 
 Table format (fudge_table.txt):
   NONBOND  C1 R1 A1 F1  C2 R2 A2 F2  dmin sigma
@@ -31,6 +46,8 @@ import os
 import re
 import shutil
 import argparse
+from fractions import Fraction
+from functools import lru_cache
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -46,6 +63,8 @@ def parse_args():
     p.add_argument("--geo",         default="default.geo")
     p.add_argument("--cbetadev",    default="")
     p.add_argument("--overridefile",default="")
+    p.add_argument("--clashes",     default="", help="probe clashes (default <prefix>_clashes.txt)")
+    p.add_argument("--watch",       default="", help="crowbar side effects (default <prefix>_crowbars.txt)")
 
     # Accept "key=val" positional arguments in tcsh style
     argv_clean = []
@@ -139,7 +158,9 @@ def load_dihedrals(geo_path):
 def entry_key(fields, attrs):
     """Identity of an entry (atoms and symmetry, not sigma/value), as text."""
     t = fields[0]
-    if t in ("NONBOND", "BOND"):
+    if t == "NONBOND" and not attrs.get("sym"):
+        k = [t] + min(fields[1:5], fields[5:9]) + max(fields[1:5], fields[5:9])
+    elif t in ("NONBOND", "BOND"):
         k = fields[:9]      # type + 2 atoms (4 fields each)
     elif t == "ANGLE":
         k = fields[:13]     # type + 3 atoms
@@ -185,7 +206,8 @@ def extract_proposals(fullgeo_path, sigma_fudge, geo_path="", cbetadev_path="", 
             if not fields_head:
                 continue
             typ = fields_head[0]
-            if typ not in ("NONBOND", "BOND", "ANGLE", "TORSION", "PLANE"):
+            # contacts are handled by crowbar_proposals
+            if typ not in ("BOND", "ANGLE", "TORSION", "PLANE"):
                 continue
 
             try:
@@ -209,19 +231,7 @@ def extract_proposals(fullgeo_path, sigma_fudge, geo_path="", cbetadev_path="", 
 
             atoms = parse_atom_specs(pipe)
 
-            if typ == "NONBOND":
-                if len(atoms) < 2:
-                    continue
-                c1,r1,a1,f1 = atoms[0]
-                c2,r2,a2,f2 = atoms[1]
-                if not (is_heavy(a1) and is_heavy(a2)):
-                    continue
-                dmin  = ideal
-                sigma = 0.4 / (abs(delta) + 1.1)
-                attrs = {"sym": sym} if sym else {}
-                proposals.append((["NONBOND", c1,r1,a1,f1, c2,r2,a2,f2, f"{dmin:.4f}", f"{sigma:.4f}"], attrs))
-
-            elif typ == "BOND":
+            if typ == "BOND":
                 if len(atoms) < 2:
                     continue
                 # phenix cannot *change a bond between symmetry mates
@@ -304,6 +314,201 @@ def extract_proposals(fullgeo_path, sigma_fudge, geo_path="", cbetadev_path="", 
     return proposals
 
 # ---------------------------------------------------------------------------
+# Crowbars: restraints that push contacts apart
+# ---------------------------------------------------------------------------
+
+CROWBAR_SIGMA = 0.4   # sigma of a new crowbar
+CROWBAR_STEP  = 0.1   # dmin added each cycle a crowbar at the floor is chosen
+
+@lru_cache(maxsize=None)
+def parse_symop(op):
+    """A symmetry operator such as "-x+1/2,y,z+1" as a comparable
+    (rotation, translation) pair; "" is the identity."""
+    rot, trans = [], []
+    for comp in (op or "x,y,z").lower().replace(" ", "").split(","):
+        row, t = [0, 0, 0], Fraction(0)
+        for sign, term in re.findall(r"([+-]?)([^+-]+)", comp):
+            s = -1 if sign == "-" else 1
+            if term in ("x", "y", "z"):
+                row["xyz".index(term)] += s
+            else:
+                t += s * Fraction(term)
+        rot.append(tuple(row))
+        trans.append(t)
+    return tuple(rot), tuple(trans)
+
+IDENTITY = parse_symop("")
+
+@lru_cache(maxsize=None)
+def inverse_symop(op):
+    """Inverse of a parse_symop operator (integer rotation, determinant +-1)."""
+    (a, b, c), (d, e, f), (g, h, i) = op[0]
+    det = a*(e*i - f*h) - b*(d*i - f*g) + c*(d*h - e*g)
+    adj = ((e*i - f*h, c*h - b*i, b*f - c*e),
+           (f*g - d*i, a*i - c*g, c*d - a*f),
+           (d*h - e*g, b*g - a*h, a*e - b*d))
+    rot = tuple(tuple(x // det for x in row) for row in adj)
+    trans = tuple(-sum(rot[r][k] * op[1][k] for k in range(3)) for r in range(3))
+    return rot, trans
+
+def load_geometry(fullgeo_path):
+    """Bonded neighbours of each atom, and every scored contact, from fullgeo.
+
+    Contacts are keyed (atom1, atom2, operator applied to atom2) and hold
+    (energy, delta, obs, ideal, sym text, fullgeo line).
+    """
+    neighbours, contacts = {}, {}
+    with open(fullgeo_path) as f:
+        for line in f:
+            typ = line.split(None, 1)[0] if line.strip() else ""
+            if typ not in ("BOND", "NONBOND") or "|" not in line:
+                continue
+            head, pipe = line.rstrip().split("|", 1)
+            sym = ""
+            m = re.search(r"\s+symop=(\S+)", pipe)
+            if m:
+                sym = m.group(1)
+                pipe = pipe[:m.start()]
+            atoms = parse_atom_specs(pipe)
+            if len(atoms) < 2:
+                continue
+            x, y = atoms[0], atoms[1]
+            if typ == "BOND":
+                if not sym:
+                    neighbours.setdefault(x, set()).add(y)
+                    neighbours.setdefault(y, set()).add(x)
+                continue
+            try:
+                energy, delta, obs, ideal = (float(w) for w in head.split()[1:5])
+            except ValueError:
+                continue
+            contacts[(x, y, parse_symop(sym))] = (energy, delta, obs, ideal, sym, line.rstrip())
+    return neighbours, contacts
+
+def find_contact(contacts, x, y, op):
+    """The scored contact between x and y (op applied to y) as
+    (atom1, atom2, entry) in fullgeo's order, or None."""
+    hit = contacts.get((x, y, op))
+    if hit:
+        return x, y, hit
+    hit = contacts.get((y, x, inverse_symop(op)))
+    if hit:
+        return y, x, hit
+    return None
+
+def parent_atoms(neighbours):
+    """Parent heavy atom of each hydrogen (the one in the hydrogen's own
+    altloc when there is a choice)."""
+    parent = {}
+    for h, bonded in neighbours.items():
+        heavy = sorted(a for a in bonded if is_heavy(a[2]))
+        if not is_heavy(h[2]) and heavy:
+            same = [a for a in heavy if a[3] == h[3]]
+            parent[h] = (same or heavy)[0]
+    return parent
+
+def parse_probe_atom(s):
+    """(C, R, A, F) from a probe atom id such as " A   3 BVAL HG21"."""
+    s = s.ljust(16)
+    return (blank(s[1]), s[2:6].strip(), s[12:16].strip(), blank(s[7]))
+
+def crowbar_proposals(neighbours, contacts, clashes_path, threshold):
+    """Crowbars for the probe clashes and for the scored contacts, each list
+    worst first and tagged, so accumulate() picks from each separately."""
+    parent = parent_atoms(neighbours)
+
+    def crowbar(x, y, op, overlap, per_h):
+        found = find_contact(contacts, parent.get(x, x), parent.get(y, y), op)
+        if not found:
+            return None
+        (c1,r1,a1,f1), (c2,r2,a2,f2), hit = found
+        dmin = hit[3] + overlap + per_h * ((x in parent) + (y in parent))
+        attrs = {"sym": hit[4]} if hit[4] else {}
+        return ["NONBOND", c1,r1,a1,f1, c2,r2,a2,f2, f"{dmin:.4f}", f"{CROWBAR_SIGMA:.4f}"], attrs
+
+    lists = {"CLASH": [], "NONBOND": []}
+    if clashes_path and os.path.exists(clashes_path):
+        with open(clashes_path) as f:
+            for line in f:
+                w = line.split("|")
+                if not line.startswith("CLASH") or len(w) < 3:
+                    continue
+                try:
+                    energy, overlap = (float(v) for v in w[0].split()[1:3])
+                except ValueError:
+                    continue
+                p = crowbar(parse_probe_atom(w[1]), parse_probe_atom(w[2]), IDENTITY, overlap, 0.0)
+                if p:
+                    lists["CLASH"].append((energy, p))
+    for (x, y, op), (energy, delta, obs, ideal, sym, line) in contacts.items():
+        if energy > threshold:
+            p = crowbar(x, y, op, delta, 0.1)
+            if p:
+                lists["NONBOND"].append((energy, p))
+
+    proposals = []
+    for via, found in lists.items():
+        found.sort(key=lambda e: -e[0])
+        proposals += [(fields, dict(attrs, _via=via)) for energy, (fields, attrs) in found]
+    return proposals
+
+def watch_crowbars(entries, neighbours, contacts, watch_path, threshold):
+    """Write, under each crowbar, the scored contacts phenix no longer
+    restrains because of it: each crowbar atom against the other's bonded
+    neighbours (1-3, switched off) and the next shell (1-4, scaled down).
+    Contacts a crowbar covers (between crowbar atoms or their hydrogens) and
+    contacts already 1-4 through covalent bonds are left out.  Returns how
+    many were listed, and those scored above threshold, worst first."""
+    def shells(a):
+        n1 = neighbours.get(a, set())
+        n2 = set().union(*(neighbours.get(b, set()) for b in n1)) - n1 - {a}
+        return n1, n2
+
+    def covalent_1_4(x, y):
+        n1, n2 = shells(x)
+        return y in n1 | n2 | set().union(*(neighbours.get(b, set()) for b in n2))
+
+    parent = parent_atoms(neighbours)
+    covered = set()
+    for fields, attrs in entries:
+        if fields[0] == "NONBOND":
+            a, b = tuple(fields[1:5]), tuple(fields[5:9])
+            op = parse_symop(attrs.get("sym", ""))
+            covered |= {(a, b, op), (b, a, inverse_symop(op))}
+
+    out, listed, close = [], 0, []
+    for fields, attrs in entries:
+        if fields[0] != "NONBOND":
+            continue
+        a, b = tuple(fields[1:5]), tuple(fields[5:9])
+        op = parse_symop(attrs.get("sym", ""))
+        a1, a2 = shells(a)
+        b1, b2 = shells(b)
+        pairs = ([("1-3", a, y) for y in b1] + [("1-3", x, b) for x in a1] +
+                 [("1-4", a, y) for y in b2] + [("1-4", x, b) for x in a2] +
+                 [("1-4", x, y) for x in a1 for y in b1])
+        hits = []
+        for kind, x, y in pairs:
+            if (parent.get(x, x), parent.get(y, y), op) in covered:
+                continue
+            if kind == "1-4" and op == IDENTITY and covalent_1_4(x, y):
+                continue
+            found = find_contact(contacts, x, y, op)
+            if found:
+                hits.append((found[2][0], kind, found[2][5]))
+        now = find_contact(contacts, a, b, op)
+        out.append("CROWBAR " + " ".join(fields[1:] + [f"{k}={v}" for k, v in attrs.items()])
+                   + (f"  now {now[2][2]:.3f} (contact distance {now[2][3]:.3f})" if now else ""))
+        for energy, kind, line in sorted(hits, reverse=True):
+            out.append(f"  {kind}  {line}")
+            if energy > threshold:
+                close.append((energy, kind, line))
+        listed += len(hits)
+    with open(watch_path, "w") as f:
+        f.write("\n".join(out) + "\n")
+    return listed, sorted(close, reverse=True)
+
+# ---------------------------------------------------------------------------
 # Step 2: Accumulate into fudge_table.txt
 # ---------------------------------------------------------------------------
 
@@ -324,8 +529,9 @@ def load_table(table_path):
                 entries.append((fields, attrs))
     return entries
 
-# Tightening floors, the same as reweight_opts_runme.com
-FLOORS = {"NONBOND": 0.1, "BOND": 0.001, "ANGLE": 0.01, "TORSION": 0.01, "PLANE": 0.001}
+# Tightening floors, the same as reweight_opts_runme.com except crowbars (NONBOND),
+# which can get as tight as a torsion before they are lengthened
+FLOORS = {"NONBOND": 0.01, "BOND": 0.001, "ANGLE": 0.01, "TORSION": 0.01, "PLANE": 0.001}
 
 def tighten(fields, sig):
     """sigma/1.5, not below the floor for its type, and never looser."""
@@ -333,19 +539,22 @@ def tighten(fields, sig):
 
 def accumulate(proposals, table_entries, maxadd):
     """Tighten or add the worst maxadd proposals of each type; relax the rest 1%.
+    A crowbar tightened past its floor is lengthened instead.
 
-    Returns the new entries and how many were tightened and added.
+    Returns the new entries and how many were tightened, lengthened and added.
     """
     chosen = {}
     count  = {}
     for p in proposals:
-        t = p[0][0]
-        if count.get(t, 0) < maxadd:
-            chosen[entry_key(*p)] = p
+        t = p[1].get("_via", p[0][0])     # crowbars: clash or contact list
+        k = entry_key(*p)
+        if count.get(t, 0) < maxadd and k not in chosen:
+            chosen[k] = p
             count[t] = count.get(t, 0) + 1
 
     new_entries = []
     in_table = set()
+    nlengthened = 0
     for fields, attrs in table_entries:
         fields = list(fields)
         k   = entry_key(fields, attrs)
@@ -354,6 +563,9 @@ def accumulate(proposals, table_entries, maxadd):
         sig = float(fields[si])
         in_table.add(k)
         if k in chosen:
+            if t == "NONBOND" and sig / 1.5 < FLOORS[t]:
+                fields[9] = f"{float(fields[9]) + CROWBAR_STEP:.4f}"
+                nlengthened += 1
             sig = tighten(fields, sig)
         else:
             # Relax; drop loose nonbond/bond
@@ -371,13 +583,14 @@ def accumulate(proposals, table_entries, maxadd):
     for k, (fields, attrs) in chosen.items():
         if k not in in_table:
             fields = list(fields)
+            attrs = {a: v for a, v in attrs.items() if not a.startswith("_")}
             if fields[0] != "NONBOND":
                 si = sigma_index(fields)
                 fields[si] = f"{tighten(fields, float(fields[si])):.6f}"
             new_entries.append((fields, attrs))
             nadded += 1
 
-    return new_entries, ntightened, nadded
+    return new_entries, ntightened, nlengthened, nadded
 
 def write_table(entries, table_path):
     if os.path.exists(table_path):
@@ -509,16 +722,29 @@ def main():
     if not os.path.exists(args.fullgeo):
         print(f"ERROR: fullgeo file not found: {args.fullgeo}", file=sys.stderr)
         sys.exit(1)
+    prefix = re.sub(r"_fullgeo\.txt$", "", args.fullgeo)
 
+    neighbours, contacts = load_geometry(args.fullgeo)
     proposals = extract_proposals(args.fullgeo, args.sigma_fudge,
                                   args.geo, args.cbetadev, args.overridefile)
-    new_entries, ntightened, nadded = accumulate(proposals, load_table(args.table), args.maxadd)
+    proposals += crowbar_proposals(neighbours, contacts,
+                                   args.clashes or prefix + "_clashes.txt", args.sigma_fudge)
+    new_entries, ntightened, nlengthened, nadded = accumulate(proposals, load_table(args.table),
+                                                             args.maxadd)
 
     write_table(new_entries, args.table)
     write_phenix(new_entries, args.outfile, load_dihedrals(args.geo))
+    listed, close = watch_crowbars(new_entries, neighbours, contacts,
+                                   args.watch or prefix + "_crowbars.txt", args.sigma_fudge)
 
+    ncrowbars = sum(1 for fields, attrs in new_entries if fields[0] == "NONBOND")
     print(f"fudgeify: wrote {args.outfile} from {args.fullgeo} ({len(new_entries)} table entries,"
-          f" {nadded} added, {ntightened} tightened)")
+          f" {nadded} added, {ntightened} tightened, {nlengthened} crowbars lengthened)")
+    worst = ""
+    if close:
+        worst = f"; worst {' '.join(close[0][2].split('|', 1)[1].split())} (energy {close[0][0]:g})"
+    print(f"fudgeify: {ncrowbars} crowbars switch off or weaken {listed} other scored contacts,"
+          f" {len(close)} of them now too close{worst}")
 
 if __name__ == "__main__":
     main()

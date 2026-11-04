@@ -52,6 +52,7 @@ ground_factory_runme.com  model.pdb  data.mtz  [options]
 | `phenix_fudge.eff` | geometry-correction restraints (problem atoms) |
 | `refmac_opts.txt` | same restraints in REFMAC external format |
 | `fudge_table.txt` | fudgeify state: sigma history across cycles |
+| `start_NNN_crowbars.txt` | contacts each crowbar switches off or weakens in phenix |
 | `ground_factory.lock` | host and PID of the run using this directory |
 | `fmodelme.pdb` | final model after REFMAC B-factor convergence |
 | `nonoise.mtz` / `simplenoise.mtz` | ideal / ~3%-noisy structure factors, at the resolution of the input mtz |
@@ -59,7 +60,8 @@ ground_factory_runme.com  model.pdb  data.mtz  [options]
 **Loop per iteration**
 
 1. `phenix.refine` with `wxc_scale=0.1`
-2. `molprobify_runme.com` → weighted energy, fullgeo file
+2. `molprobify_runme.com` → weighted energy, fullgeo file, restraint
+   proposals (`refmac_opts_*.txt`, read by steps 3 and 4)
 3. `redo_harmonics_runme.com` → update `phenix_holdme.eff`
 4. `reweight_opts_runme.com` → update `refmac_opts.txt`; writes `phenix_fudge.eff`
    (overwritten by fudgeify when `fudgeify=1`)
@@ -104,7 +106,9 @@ Compares the starting model to the current iteration output.  Atoms that became
 worse (appeared in bad-atom lists for the first time) get harmonic positional
 restraints (`sigma = 0.1 Å`) in `phenix_holdme.eff` so the X-ray term cannot
 pull them further from ideal geometry.  Waters that drifted > 0.1 Å are also
-restrained.
+restrained.  When both atoms of a crowbar (a `NONBOND` entry in
+`fudge_table.txt`) are held, both are released, since the crowbar could not
+move either.
 
 ---
 
@@ -138,15 +142,35 @@ When `fudgeify=1`, this file is immediately overwritten by `fudgeify.py`.
 Python replacement for the tcsh/awk fudge-generation logic in
 `reweight_opts_runme.com`.  Recommended for new runs (`fudgeify=1`).
 
-Reads a `*_fullgeo.txt`; accumulates sigma state in `fudge_table.txt`;
-writes `phenix_fudge.eff`.  Each call is one cycle:
+Reads a `*_fullgeo.txt` and the matching `*_clashes.txt`; accumulates sigma
+state in `fudge_table.txt`; writes `phenix_fudge.eff`.  Each call is one
+cycle:
 
 | Event | Action |
 |-------|--------|
-| One of the worst `maxadd` outliers of its type, not yet in the table | Add: NONBOND at `0.4/(|delta|+1.1)`; BOND/ANGLE/TORSION at natural sigma/1.5 (they change phenix's own restraint, so natural sigma would change nothing) |
-| One of the worst `maxadd` outliers of its type, already in the table | Tighten: `sigma /= 1.5`, down to the reweight_opts floors (NONBOND 0.1, BOND 0.001, ANGLE and TORSION 0.01) |
+| One of the worst `maxadd` outliers of its type, not yet in the table | Add: a crowbar at sigma 0.4; BOND/ANGLE/TORSION at natural sigma/1.5 (they change phenix's own restraint, so natural sigma would change nothing) |
+| One of the worst `maxadd` outliers of its type, already in the table | Tighten: `sigma /= 1.5`, down to the floors (crowbar 0.01, BOND 0.001, ANGLE and TORSION 0.01) |
+| A crowbar chosen again at its floor | Lengthen: `dmin += 0.1` |
 | Anything else in the table | Relax: `sigma *= 1.01` |
 | NONBOND or BOND sigma ≥ 5 | Drop (restraint resolved) |
+
+**Crowbars** (NONBOND entries) push contacts apart: a phenix bond that only
+pushes, flat from `dmin` out to `dmin+2` (`distance_ideal = dmin+1`,
+`slack = 1`).  Probe clashes and scored contacts (fullgeo `NONBOND` lines)
+are two separate lists, each giving its worst `maxadd` per cycle.  A
+hydrogen is replaced by its parent heavy atom, since crowbarring a hydrogen
+only bends it, and `dmin` is the parents' contact distance plus the overlap
+(plus 0.1 Å per hydrogen replaced, for scored contacts).  Parents that
+phenix does not treat as a contact (bonded or angle neighbours) get no
+crowbar.
+
+A crowbar goes into phenix's bond graph, so phenix switches off the contacts
+between each crowbar atom and the other atom's bonded neighbours (1-3) and
+weakens the next shell (1-4, vdW × 0.8).  They are still scored.  Each cycle
+`start_NNN_crowbars.txt` lists them under their crowbar, with the crowbar's
+current distance and the contact distance, and the log counts how many are
+now too close.  Lengthening has no limit, so a contact that never resolves
+keeps getting longer; that file shows it.
 
 Bond changes need phenix's conformation-dependent library off, which is
 ground_factory's default (`cdl=False`).  CDL sets the C–N, N–CA, CA–CB, CA–C
@@ -156,8 +180,8 @@ macro-cycle, so with CDL on an edit to one of those bonds changes nothing.
 so refinement and wE use the same ideal values.  Bonds between symmetry
 mates are not changed.
 
-NONBOND entries between symmetry mates keep the operator (`sym=` in the
-table, `symmetry_operation` in the eff).  A torsion phenix already restrains
+Crowbars between symmetry mates keep the operator (`sym=` in the table,
+`symmetry_operation` in the eff).  A torsion phenix already restrains
 (found in `default.geo`) is changed in place rather than added, because phenix
 refuses duplicate dihedrals; fudge torsions are harmonic (`periodicity = 0`;
 phenix's default of 1 means sinusoidal).  Torsions named in `overrides.txt`
@@ -168,6 +192,7 @@ are skipped (exact atom match, either direction).
 ```
 python3 fudgeify.py  start_006_fullgeo.txt  [maxadd=1]  [outfile=phenix_fudge.eff]
                      [table=fudge_table.txt]  [overridefile=overrides.txt]
+                     [clashes=start_006_clashes.txt]  [watch=start_006_crowbars.txt]
 ```
 
 Key-value arguments (`key=val`) are accepted alongside normal flags.
