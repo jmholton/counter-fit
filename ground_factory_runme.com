@@ -27,6 +27,9 @@
 #     fudgeify=0         if 1, fudgeify.py writes phenix_fudge.eff instead of reweight_opts
 #     crowbars=N         with fudgeify, clashes and contacts crowbarred per cycle,
 #                        each (default maxadd)
+#     bonds=N angles=N torsions=N planes=N
+#                        with fudgeify, outliers of that kind restrained per
+#                        cycle (default maxadd; torsions include CB deviations)
 #     cdl=False         phenix conformation-dependent library, in refinement and
 #                        in molprobify scoring.  CDL rewrites backbone bond
 #                        restraints every macro-cycle, undoing edits to them
@@ -57,6 +60,10 @@ set snap_interval = 0
 set snap_wxc      = 1.0
 set fudgeify      = 0
 set crowbars      = ""
+set bonds         = ""
+set angles        = ""
+set torsions      = ""
+set planes        = ""
 set cdl           = False
 set fixweights    = 1
 
@@ -77,10 +84,18 @@ foreach Arg ( $* )
   if("$key" == "snap_wxc")      set snap_wxc      = $val
   if("$key" == "fudgeify")      set fudgeify      = $val
   if("$key" == "crowbars")      set crowbars      = $val
+  if("$key" == "bonds")         set bonds         = $val
+  if("$key" == "angles")        set angles        = $val
+  if("$key" == "torsions")      set torsions      = $val
+  if("$key" == "planes")        set planes        = $val
   if("$key" == "cdl")           set cdl           = $val
   if("$key" == "fixweights")    set fixweights    = $val
 end
 if("$crowbars" == "") set crowbars = $maxadd
+if("$bonds" == "")    set bonds    = $maxadd
+if("$angles" == "")   set angles   = $maxadd
+if("$torsions" == "") set torsions = $maxadd
+if("$planes" == "")   set planes   = $maxadd
 
 if("$pdbfile" == "" || "$mtzfile" == "") then
   echo "Usage: ground_factory_runme.com model.pdb data.mtz [options]"
@@ -327,7 +342,8 @@ foreach x ( `seq 1 $maxcycles` )
 
   if($fudgeify) then
     python3 ${scriptdir}/fudgeify.py ${prefix}_${num}_fullgeo.txt \
-      maxadd=$maxadd crowbars=$crowbars outfile=phenix_fudge.eff $overridearg
+      maxadd=$maxadd crowbars=$crowbars bonds=$bonds angles=$angles \
+      torsions=$torsions planes=$planes outfile=phenix_fudge.eff $overridearg
     if($status) then
       echo "ERROR: fudgeify.py failed at iteration $num — stopping"
       break

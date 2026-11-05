@@ -38,6 +38,10 @@ ground_factory_runme.com  model.pdb  data.mtz  [options]
                      phenix_fudge.eff (recommended for new runs)
   crowbars=N         with fudgeify, clashes and contacts crowbarred per cycle,
                      each (default maxadd; 0 = no crowbars)
+  bonds=N  angles=N  torsions=N  planes=N
+                     with fudgeify, outliers of that kind restrained per cycle
+                     (default maxadd; torsions include CB deviations, planes
+                     include the impropers that stand in for peptide planes)
   cdl=False          phenix conformation-dependent library, in refinement and
                      in molprobify scoring (CDL undoes backbone bond edits)
   fixweights=1       fix phenix's X-ray weights at iteration 001's values
@@ -219,6 +223,7 @@ are skipped (exact atom match, either direction).
 
 ```
 python3 fudgeify.py  start_006_fullgeo.txt  [maxadd=1]  [crowbars=1]  [outfile=phenix_fudge.eff]
+                     [bonds=1]  [angles=1]  [torsions=1]  [planes=1]
                      [table=fudge_table.txt]  [overridefile=overrides.txt]
                      [clashes=start_006_clashes.txt]  [watch=start_006_crowbars.txt]
                      [pdb=start_006.pdb]  [geo=default.geo]

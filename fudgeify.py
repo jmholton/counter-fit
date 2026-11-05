@@ -6,6 +6,7 @@ Read the fullgeo output of molprobify and generate phenix geometry
 correction restraints, accumulating sigma-tightening state in fudge_table.txt.
 
 Each call is one ground_factory cycle: the worst maxadd outliers of each type
+(or bonds=N, angles=N, torsions=N, planes=N, crowbars=N for one category)
 are added or tightened (sigma/1.5, down to the floors reweight_opts uses), and
 every other entry is relaxed (sigma*1.01); NONBOND and BOND entries are
 dropped once relaxed to sigma 5.  A new BOND, ANGLE or TORSION entry changes
@@ -69,6 +70,11 @@ def parse_args():
     p.add_argument("--maxadd",      type=int,   default=1)
     p.add_argument("--crowbars",    type=int,   default=-1,
                    help="clashes and contacts crowbarred per cycle, each (default maxadd)")
+    p.add_argument("--bonds",       type=int,   default=-1, help="bonds per cycle (default maxadd)")
+    p.add_argument("--angles",      type=int,   default=-1, help="angles per cycle (default maxadd)")
+    p.add_argument("--torsions",    type=int,   default=-1,
+                   help="torsions, CB deviations included, per cycle (default maxadd)")
+    p.add_argument("--planes",      type=int,   default=-1, help="planes per cycle (default maxadd)")
     p.add_argument("--sigma_fudge", type=float, default=1.0)
     p.add_argument("--outfile",     default="phenix_fudge.eff")
     p.add_argument("--geo",         default="default.geo")
@@ -692,20 +698,19 @@ def tighten(fields, sig):
     """sigma/1.5, not below the floor for its type, and never looser."""
     return max(sig / 1.5, min(sig, FLOORS.get(fields[0], 0.001)))
 
-def accumulate(proposals, table_entries, maxadd, ncrowbars=None):
-    """Tighten or add the worst maxadd proposals of each type, and the worst
-    ncrowbars (default maxadd) of each crowbar list; relax the rest 1%.
-    A crowbar tightened past its floor is lengthened instead.
+def accumulate(proposals, table_entries, maxadd, limits={}):
+    """Tighten or add the worst proposals of each category: limits[category]
+    of them, default maxadd.  The categories are the types, except that the
+    crowbar lists are CLASH and NONBOND and planes are PLANE.  Relax the rest
+    1%.  A crowbar tightened past its floor is lengthened instead.
 
     Returns the new entries and how many were tightened, lengthened and added.
     """
-    if ncrowbars is None:
-        ncrowbars = maxadd
     chosen = {}
     count  = {}
     for p in proposals:
         t = p[1].get("_via", p[0][0])     # crowbars: clash or contact list; planes
-        limit = ncrowbars if t in ("CLASH", "NONBOND") else maxadd
+        limit = limits.get(t, maxadd)
         k = entry_key(*p)
         if count.get(t, 0) < limit and k not in chosen:
             chosen[k] = p
@@ -896,9 +901,11 @@ def main():
                                      neighbours, dihedrals, args.sigma_fudge)
     else:
         print(f"fudgeify: no {pdb}, so no planes", file=sys.stderr)
-    ncrowbars = args.crowbars if args.crowbars >= 0 else args.maxadd
+    limits = {t: n for t, n in (("CLASH", args.crowbars), ("NONBOND", args.crowbars),
+                                ("BOND", args.bonds), ("ANGLE", args.angles),
+                                ("TORSION", args.torsions), ("PLANE", args.planes)) if n >= 0}
     new_entries, ntightened, nlengthened, nadded = accumulate(proposals, load_table(args.table),
-                                                             args.maxadd, ncrowbars)
+                                                             args.maxadd, limits)
 
     write_table(new_entries, args.table)
     write_phenix(new_entries, args.outfile, dihedrals)
