@@ -343,7 +343,8 @@ foreach x ( `seq 1 $maxcycles` )
   if($fudgeify) then
     python3 ${scriptdir}/fudgeify.py ${prefix}_${num}_fullgeo.txt \
       maxadd=$maxadd crowbars=$crowbars bonds=$bonds angles=$angles \
-      torsions=$torsions planes=$planes outfile=phenix_fudge.eff $overridearg
+      torsions=$torsions planes=$planes outfile=phenix_fudge.eff $overridearg \
+      cbetadev=${prefix}_${num}_cbetadev.log
     if($status) then
       echo "ERROR: fudgeify.py failed at iteration $num — stopping"
       break

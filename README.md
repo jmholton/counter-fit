@@ -219,6 +219,15 @@ refuses duplicate dihedrals; fudge torsions are harmonic (`periodicity = 0`;
 phenix's default of 1 means sinusoidal).  Torsions named in `overrides.txt`
 are skipped (exact atom match, either direction).
 
+**CB deviations.**  ground_factory turns phenix's `c_beta_restraints` off,
+so fudgeify restrains them itself, from `<prefix>_cbetadev.log` (passed as
+`cbetadev=`).  Each deviation is scored as (dev/0.05)², as molprobify scores
+it, and ranked with the fullgeo outliers; the worst `torsions` per cycle get
+the pair of pseudo-dihedrals phenix would use (N–C–CA–CB and C–N–CA–CB, ideals
+from phenix `c_beta.py`, sigma 2.5), added as new restraints and tightened
+like the others.  The N/C–CA–CB torsions in fullgeo are skipped, since these
+pairs replace them.
+
 **Usage**
 
 ```
@@ -227,6 +236,7 @@ python3 fudgeify.py  start_006_fullgeo.txt  [maxadd=1]  [crowbars=1]  [outfile=p
                      [table=fudge_table.txt]  [overridefile=overrides.txt]
                      [clashes=start_006_clashes.txt]  [watch=start_006_crowbars.txt]
                      [pdb=start_006.pdb]  [geo=default.geo]
+                     [cbetadev=start_006_cbetadev.log]
 ```
 
 Key-value arguments (`key=val`) are accepted alongside normal flags.

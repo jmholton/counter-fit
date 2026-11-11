@@ -262,7 +262,7 @@ def extract_proposals(fullgeo_path, sigma_fudge, geo_path="", cbetadev_path="", 
                 if a1 == "SG" and a2 == "SG":
                     continue
                 sigma_use = max(sigma_nat, 0.001)
-                proposals.append((["BOND", c1,r1,a1,f1, c2,r2,a2,f2, f"{ideal:.4f}", f"{sigma_use:.6f}"], {}))
+                proposals.append((["BOND", c1,r1,a1,f1, c2,r2,a2,f2, f"{ideal:.4f}", f"{sigma_use:.6f}"], {"_energy": energy}))
 
             elif typ == "ANGLE":
                 if len(atoms) < 3:
@@ -273,7 +273,7 @@ def extract_proposals(fullgeo_path, sigma_fudge, geo_path="", cbetadev_path="", 
                 if not all(is_heavy(a) for a in (a1,a2,a3)):
                     continue
                 sigma_use = max(sigma_nat, 0.001)
-                proposals.append((["ANGLE", c1,r1,a1,f1, c2,r2,a2,f2, c3,r3,a3,f3, f"{ideal:.4f}", f"{sigma_use:.6f}"], {}))
+                proposals.append((["ANGLE", c1,r1,a1,f1, c2,r2,a2,f2, c3,r3,a3,f3, f"{ideal:.4f}", f"{sigma_use:.6f}"], {"_energy": energy}))
 
             elif typ == "TORSION":
                 if len(atoms) < 4:
@@ -293,9 +293,11 @@ def extract_proposals(fullgeo_path, sigma_fudge, geo_path="", cbetadev_path="", 
                     continue
                 sigma_use = max(sigma_nat, 0.001)
                 proposals.append((["TORSION", c1,r1,a1,f1, c2,r2,a2,f2, c3,r3,a3,f3, c4,r4,a4,f4,
-                                   f"{ideal:.4f}", f"{sigma_use:.6f}", "0"], {}))
+                                   f"{ideal:.4f}", f"{sigma_use:.6f}", "0"], {"_energy": energy}))
 
-    # CBdev pseudo-dihedrals
+    # CBdev pseudo-dihedrals, from phenix.cbetadev output (molprobify's <prefix>_cbetadev.log):
+    #   pdb:alt:res:chainID:resnum:dev:dihedralNABB:Occ:ALT:
+    # energy = (dev/0.05)^2, as molprobify scores it; ideals as phenix c_beta.py
     if cbetadev_path and os.path.exists(cbetadev_path):
         ideal_ncab = {
             "ala":122.9, "pro":115.1, "val":123.4, "thr":123.4,
@@ -308,22 +310,25 @@ def extract_proposals(fullgeo_path, sigma_fudge, geo_path="", cbetadev_path="", 
         with open(cbetadev_path) as f:
             for line in f:
                 cols = line.split(":")
-                if len(cols) < 5:
+                if len(cols) < 6 or line.startswith(("pdb:", "SUMMARY")):
                     continue
                 try:
-                    en = float(cols[1])
+                    en = (float(cols[5]) / 0.05)**2
                 except ValueError:
                     continue
                 if en <= sigma_fudge:
                     continue
-                alt = blank(cols[2]); res = cols[3].strip().lower()
-                c   = blank(cols[4]); r   = cols[5].strip() if len(cols)>5 else "_"
+                alt = blank(cols[1]); res = cols[2].strip().lower()
+                c   = blank(cols[3]); r   = cols[4].strip()
                 ncab = ideal_ncab.get(res, 122.8)
                 cnab = ideal_cnab.get(res, -122.6)
                 for v, desc in [(ncab,"N"), (cnab,"C")]:
                     proposals.append((["TORSION", c,r,desc,alt, c,r,("C" if desc=="N" else "N"),alt,
-                                       c,r,"CA",alt, c,r,"CB",alt, f"{v:.4f}", "2.5", "0"], {}))
+                                       c,r,"CA",alt, c,r,"CB",alt, f"{v:.4f}", "2.5", "0"],
+                                      {"_via": "CBDEV", "_energy": en}))
 
+    # worst first across fullgeo and CBdev (stable, so ties keep file order)
+    proposals.sort(key=lambda p: -p[1].get("_energy", 0.0))
     return proposals
 
 # ---------------------------------------------------------------------------
@@ -747,7 +752,7 @@ def accumulate(proposals, table_entries, maxadd, limits={}):
     for k, (fields, attrs) in chosen.items():
         if k not in in_table:
             fields = list(fields)
-            adds = attrs.get("_via") in ("CLASH", "NONBOND", "PLANE")
+            adds = attrs.get("_via") in ("CLASH", "NONBOND", "PLANE", "CBDEV")
             attrs = {a: v for a, v in attrs.items() if not a.startswith("_")}
             if not adds:
                 si = sigma_index(fields)
@@ -904,6 +909,8 @@ def main():
     limits = {t: n for t, n in (("CLASH", args.crowbars), ("NONBOND", args.crowbars),
                                 ("BOND", args.bonds), ("ANGLE", args.angles),
                                 ("TORSION", args.torsions), ("PLANE", args.planes)) if n >= 0}
+    # a CB deviation is a pair of pseudo-dihedrals, counted against the torsion limit
+    limits["CBDEV"] = 2 * limits.get("TORSION", args.maxadd)
     new_entries, ntightened, nlengthened, nadded = accumulate(proposals, load_table(args.table),
                                                              args.maxadd, limits)
 
