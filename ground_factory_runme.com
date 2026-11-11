@@ -37,6 +37,8 @@
 #                        averages in iteration 001 (then scaled by wxc and wxu),
 #                        with the ml target in every macro-cycle; 0 = phenix
 #                        recomputes them every macro-cycle
+#     fix_wxc=X          with fixweights, use X as phenix's fix_wxc instead of
+#                        iteration 001's wxc times wxc (snaps: X*snap_wxc/wxc)
 #
 #   Outputs:
 #     start_NNN.pdb    phenix-refined model each iteration
@@ -66,6 +68,7 @@ set torsions      = ""
 set planes        = ""
 set cdl           = False
 set fixweights    = 1
+set fix_wxc       = ""
 
 foreach Arg ( $* )
   set key = `echo $Arg | awk -F= '{print $1}'`
@@ -90,6 +93,7 @@ foreach Arg ( $* )
   if("$key" == "planes")        set planes        = $val
   if("$key" == "cdl")           set cdl           = $val
   if("$key" == "fixweights")    set fixweights    = $val
+  if("$key" == "fix_wxc")       set fix_wxc       = $val
 end
 if("$crowbars" == "") set crowbars = $maxadd
 if("$bonds" == "")    set bonds    = $maxadd
@@ -232,6 +236,7 @@ if($fixweights) then
     exit 1
   endif
   echo "fixed weights from iteration 001: wxc wxu = `cat fixed_weights.txt`"
+  if("$fix_wxc" != "") echo "fix_wxc set to $fix_wxc instead"
 endif
 
 # -----------------------------------------------------------------------
@@ -275,6 +280,7 @@ foreach x ( `seq 1 $maxcycles` )
   # phenix ignores wxc_scale when wxc is fixed, but still applies wxu_scale
   set weightargs = ""
   if($fixweights) set weightargs = `awk -v s=$wxc_now '{print "target_weights.fix_wxc=" $1*s, "target_weights.fix_wxu=" $2}' fixed_weights.txt`
+  if($fixweights && "$fix_wxc" != "") set weightargs = `awk -v x=$fix_wxc -v s=$wxc_now -v w=$wxc '{print "target_weights.fix_wxc=" x*s/w, "target_weights.fix_wxu=" $2}' fixed_weights.txt`
 
   $PHENIXRUN $startpdb $mtzfile \
     prefix=${prefix} serial=${num} \

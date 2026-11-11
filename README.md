@@ -46,6 +46,8 @@ ground_factory_runme.com  model.pdb  data.mtz  [options]
                      in molprobify scoring (CDL undoes backbone bond edits)
   fixweights=1       fix phenix's X-ray weights at iteration 001's values
                      (see below); 0 = phenix recomputes them every macro-cycle
+  fix_wxc=X          with fixweights=1, pass X as fix_wxc instead of iteration
+                     001's wxc × wxc_scale (snap iterations: X × snap_wxc / wxc)
   overrides=file     TORSION OVERRIDE file — genuine outliers that must not
                      be tightened (see OVERRIDE policy below)
 ```
