@@ -38,6 +38,13 @@ peptide's CA, C, O, N) is restrained instead by an improper dihedral on the
 same 4 atoms (a TORSION entry), which is the one way 4 atoms leave a plane.
 Like crowbars, they add a restraint, so they start at phenix's sigma.
 
+Omegas (CA C N CA torsions) are their own category (omegas=N per cycle,
+default maxadd), ranked by molprobify's omega energy rather than phenix's:
+molprobify's sigma is 4.01 degrees, phenix's 5, so an omega phenix calls
+fine can still score.  Next to a proline the energy is divided by 3, as
+molprobify does.  The scored average over all omegas is phenix's sigma
+showing; ground_factory omega_esd=X changes that sigma for every omega.
+
 Table format (fudge_table.txt):
   NONBOND  C1 R1 A1 F1  C2 R2 A2 F2  dmin sigma
   BOND     C1 R1 A1 F1  C2 R2 A2 F2  value sigma
@@ -75,6 +82,9 @@ def parse_args():
     p.add_argument("--torsions",    type=int,   default=-1,
                    help="torsions, CB deviations included, per cycle (default maxadd)")
     p.add_argument("--planes",      type=int,   default=-1, help="planes per cycle (default maxadd)")
+    p.add_argument("--omegas",      type=int,   default=-1, help="omegas per cycle (default maxadd)")
+    p.add_argument("--omega_esd",   type=float, default=0.0,
+                   help="phenix's omega sigma in refinement, if overridden (ground_factory omega_esd)")
     p.add_argument("--sigma_fudge", type=float, default=1.0)
     p.add_argument("--outfile",     default="phenix_fudge.eff")
     p.add_argument("--geo",         default="default.geo")
@@ -202,7 +212,28 @@ def sigma_index(fields):
     else:
         return len(fields) - 1
 
-def extract_proposals(fullgeo_path, sigma_fudge, geo_path="", cbetadev_path="", override_path=""):
+def load_resnames(fullgeo_path):
+    """Residue name of every residue number in the fullgeo atom specs."""
+    resnames = {}
+    with open(fullgeo_path) as f:
+        for line in f:
+            if "|" in line:
+                for p in re.split(r'\s+-\s+', line.split("|", 1)[1].strip()):
+                    w = p.split()
+                    if len(w) >= 5 and w[4].lstrip("-").isdigit():
+                        resnames[int(w[4])] = w[2]
+    return resnames
+
+def omega_energy(omega, resi, resnames):
+    """molprobify's omega energy (its allomegas): sigma 4.01 degrees, divided
+    by 3 for each proline next to residue resi (the omega's first CA)."""
+    om = math.radians(omega)
+    npro = sum(resnames.get(resi + d) == "PRO" for d in (-1, 1))
+    return ((math.sin(om) / math.sin(math.radians(4.01398721805631)))**2
+            + (1 + math.cos(om))**10) / (2 * npro + 1)
+
+def extract_proposals(fullgeo_path, sigma_fudge, geo_path="", cbetadev_path="", override_path="",
+                      omega_esd=0.0):
     """Return list of (fields, attrs) proposals from fullgeo, worst first."""
     proposals = []
 
@@ -214,6 +245,7 @@ def extract_proposals(fullgeo_path, sigma_fudge, geo_path="", cbetadev_path="", 
                 if line.startswith("TORSION") and "OVERRIDE" in line and "|" in line:
                     overridden.add(tuple(line.split("|", 1)[1].split()))
 
+    resnames = load_resnames(fullgeo_path)
     with open(fullgeo_path) as f:
         for line in f:
             line = line.rstrip()
@@ -237,7 +269,8 @@ def extract_proposals(fullgeo_path, sigma_fudge, geo_path="", cbetadev_path="", 
             except (IndexError, ValueError):
                 continue
 
-            if energy <= sigma_fudge:
+            # omegas are judged by their scored energy, below
+            if energy <= sigma_fudge and typ != "TORSION":
                 continue
 
             # contact with a symmetry mate: operator applies to the second atom
@@ -291,9 +324,23 @@ def extract_proposals(fullgeo_path, sigma_fudge, geo_path="", cbetadev_path="", 
                 ov = tuple(f"{a}_{r}" for c, r, a, f in atoms[:4])
                 if ov in overridden or ov[::-1] in overridden:
                     continue
+                # omega (CA C N CA): its own category, ranked by molprobify's omega
+                # energy (sigma 4.01 deg; phenix restrains it at 5).  A cis peptide
+                # scores ~1000 there, but tightening it cannot help, so it is left out
+                attrs = {"_energy": energy}
+                if (a1,a2,a3,a4) in (("CA","C","N","CA"), ("CA","N","C","CA")):
+                    if abs(ideal) < 90:
+                        continue
+                    energy = omega_energy(obs, int(r1), resnames)
+                    attrs = {"_via": "OMEGA", "_energy": energy}
+                    # fullgeo has phenix's default sigma; omega_esd overrides it in refinement
+                    if omega_esd > 0:
+                        sigma_nat = min(sigma_nat, omega_esd)
+                if energy <= sigma_fudge:
+                    continue
                 sigma_use = max(sigma_nat, 0.001)
                 proposals.append((["TORSION", c1,r1,a1,f1, c2,r2,a2,f2, c3,r3,a3,f3, c4,r4,a4,f4,
-                                   f"{ideal:.4f}", f"{sigma_use:.6f}", "0"], {"_energy": energy}))
+                                   f"{ideal:.4f}", f"{sigma_use:.6f}", "0"], attrs))
 
     # CBdev pseudo-dihedrals, from phenix.cbetadev output (molprobify's <prefix>_cbetadev.log):
     #   pdb:alt:res:chainID:resnum:dev:dihedralNABB:Occ:ALT:
@@ -897,7 +944,7 @@ def main():
     neighbours, contacts = load_geometry(args.fullgeo)
     dihedrals = load_dihedrals(args.geo)
     proposals = extract_proposals(args.fullgeo, args.sigma_fudge,
-                                  args.geo, args.cbetadev, args.overridefile)
+                                  args.geo, args.cbetadev, args.overridefile, args.omega_esd)
     proposals += crowbar_proposals(neighbours, contacts,
                                    args.clashes or prefix + "_clashes.txt", args.sigma_fudge)
     pdb = args.pdb or prefix + ".pdb"
@@ -908,7 +955,8 @@ def main():
         print(f"fudgeify: no {pdb}, so no planes", file=sys.stderr)
     limits = {t: n for t, n in (("CLASH", args.crowbars), ("NONBOND", args.crowbars),
                                 ("BOND", args.bonds), ("ANGLE", args.angles),
-                                ("TORSION", args.torsions), ("PLANE", args.planes)) if n >= 0}
+                                ("TORSION", args.torsions), ("PLANE", args.planes),
+                                ("OMEGA", args.omegas)) if n >= 0}
     # a CB deviation is a pair of pseudo-dihedrals, counted against the torsion limit
     limits["CBDEV"] = 2 * limits.get("TORSION", args.maxadd)
     new_entries, ntightened, nlengthened, nadded = accumulate(proposals, load_table(args.table),

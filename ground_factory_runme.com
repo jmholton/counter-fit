@@ -39,6 +39,9 @@
 #                        recomputes them every macro-cycle
 #     fix_wxc=X          with fixweights, use X as phenix's fix_wxc instead of
 #                        iteration 001's wxc times wxc (snaps: X*snap_wxc/wxc)
+#     omegas=N           with fudgeify, omegas restrained per cycle (default maxadd)
+#     omega_esd=X        phenix's sigma for every omega, in degrees (phenix: 5;
+#                        molprobify scores omegas at 4.01)
 #
 #   Outputs:
 #     start_NNN.pdb    phenix-refined model each iteration
@@ -69,6 +72,8 @@ set planes        = ""
 set cdl           = False
 set fixweights    = 1
 set fix_wxc       = ""
+set omegas        = ""
+set omega_esd     = ""
 
 foreach Arg ( $* )
   set key = `echo $Arg | awk -F= '{print $1}'`
@@ -94,12 +99,15 @@ foreach Arg ( $* )
   if("$key" == "cdl")           set cdl           = $val
   if("$key" == "fixweights")    set fixweights    = $val
   if("$key" == "fix_wxc")       set fix_wxc       = $val
+  if("$key" == "omegas")        set omegas        = $val
+  if("$key" == "omega_esd")     set omega_esd     = $val
 end
 if("$crowbars" == "") set crowbars = $maxadd
 if("$bonds" == "")    set bonds    = $maxadd
 if("$angles" == "")   set angles   = $maxadd
 if("$torsions" == "") set torsions = $maxadd
 if("$planes" == "")   set planes   = $maxadd
+if("$omegas" == "")   set omegas   = $maxadd
 
 if("$pdbfile" == "" || "$mtzfile" == "") then
   echo "Usage: ground_factory_runme.com model.pdb data.mtz [options]"
@@ -135,6 +143,13 @@ if($srun) set PHENIXRUN = "srun -p debug phenix.refine"
 # needs one target
 set targetarg = ""
 if($fixweights) set targetarg = "main.target=ml"
+
+set omegaarg = ""
+set omegafudge = ""
+if("$omega_esd" != "") then
+  set omegaarg = "pdb_interpretation.peptide_link.omega_esd_override_value=$omega_esd"
+  set omegafudge = "omega_esd=$omega_esd"
+endif
 
 # -----------------------------------------------------------------------
 # Step 1: SS bonds
@@ -212,7 +227,7 @@ if(! -e default.geo) then
   $PHENIXRUN $pdbfile $mtzfile \
     prefix=${prefix} serial=001 \
     $ssargs noocc.eff \
-    wxc_scale=${wxc} wxu_scale=${wxu} $targetarg \
+    wxc_scale=${wxc} wxu_scale=${wxu} $targetarg $omegaarg \
     main.number_of_macro_cycles=5 cdl=${cdl} \
     write_geo_file=True \
     phenix_holdme.eff phenix_fudge.eff >! phenix_001.log
@@ -285,7 +300,7 @@ foreach x ( `seq 1 $maxcycles` )
   $PHENIXRUN $startpdb $mtzfile \
     prefix=${prefix} serial=${num} \
     $ssargs noocc.eff \
-    wxc_scale=${wxc_now} wxu_scale=${wxu} $targetarg $weightargs \
+    wxc_scale=${wxc_now} wxu_scale=${wxu} $targetarg $omegaarg $weightargs \
     main.number_of_macro_cycles=5 cdl=${cdl} \
     write_geo_file=True \
     phenix_holdme.eff phenix_fudge.eff >! phenix_${num}.log
@@ -349,7 +364,7 @@ foreach x ( `seq 1 $maxcycles` )
   if($fudgeify) then
     python3 ${scriptdir}/fudgeify.py ${prefix}_${num}_fullgeo.txt \
       maxadd=$maxadd crowbars=$crowbars bonds=$bonds angles=$angles \
-      torsions=$torsions planes=$planes outfile=phenix_fudge.eff $overridearg \
+      torsions=$torsions planes=$planes omegas=$omegas $omegafudge outfile=phenix_fudge.eff $overridearg \
       cbetadev=${prefix}_${num}_cbetadev.log
     if($status) then
       echo "ERROR: fudgeify.py failed at iteration $num — stopping"

@@ -48,6 +48,9 @@ ground_factory_runme.com  model.pdb  data.mtz  [options]
                      (see below); 0 = phenix recomputes them every macro-cycle
   fix_wxc=X          with fixweights=1, pass X as fix_wxc instead of iteration
                      001's wxc × wxc_scale (snap iterations: X × snap_wxc / wxc)
+  omegas=N           with fudgeify, omegas restrained per cycle (default maxadd)
+  omega_esd=X        phenix's sigma for every omega, degrees (phenix 5;
+                     molprobify scores at 4.01)
   overrides=file     TORSION OVERRIDE file — genuine outliers that must not
                      be tightened (see OVERRIDE policy below)
 ```
@@ -230,11 +233,19 @@ from phenix `c_beta.py`, sigma 2.5), added as new restraints and tightened
 like the others.  The N/C–CA–CB torsions in fullgeo are skipped, since these
 pairs replace them.
 
+**Omegas.**  The CA–C–N–CA torsions are their own category (`omegas` per
+cycle, default maxadd), ranked by molprobify's omega energy: its sigma is 4.01°
+where phenix restrains omega at 5°, so an omega phenix calls fine still scores,
+and the scored average over all omegas sits at about (5/4.01)² ≈ 1.5.  One per
+cycle cannot move that average; ground_factory `omega_esd=X` sets phenix's
+sigma for every omega (`pdb_interpretation.peptide_link.omega_esd_override_value`).
+Cis peptides are left out.
+
 **Usage**
 
 ```
 python3 fudgeify.py  start_006_fullgeo.txt  [maxadd=1]  [crowbars=1]  [outfile=phenix_fudge.eff]
-                     [bonds=1]  [angles=1]  [torsions=1]  [planes=1]
+                     [bonds=1]  [angles=1]  [torsions=1]  [planes=1]  [omegas=1]
                      [table=fudge_table.txt]  [overridefile=overrides.txt]
                      [clashes=start_006_clashes.txt]  [watch=start_006_crowbars.txt]
                      [pdb=start_006.pdb]  [geo=default.geo]
