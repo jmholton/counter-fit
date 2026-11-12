@@ -42,6 +42,15 @@
 #     omegas=N           with fudgeify, omegas restrained per cycle (default maxadd)
 #     omega_esd=X        phenix's sigma for every omega, in degrees (phenix: 5;
 #                        molprobify scores omegas at 4.01)
+#     macrocycles=5      refinement macro-cycles (refmac: cycles) per iteration
+#     engine=phenix      program refining each iteration: phenix, or refmac, which
+#                        reads the REFMAC restraints in refmac_opts.txt (no fudgeify)
+#     labin=...          with engine=refmac, the LABIN assignments
+#                        (default FP=FP SIGFP=SIGFP FREE=FreeR_flag)
+#     refmac_weight=X    with engine=refmac, the matrix weight (default: refmac's
+#                        automatic weight in its first iteration, times wxc)
+#     lean=0             if 1, phenix skips the maps, mtz, cif and def files of each
+#                        iteration (nothing reads them; ~13 s less per iteration)
 #
 #   Outputs:
 #     start_NNN.pdb    phenix-refined model each iteration
@@ -74,6 +83,11 @@ set fixweights    = 1
 set fix_wxc       = ""
 set omegas        = ""
 set omega_esd     = ""
+set macrocycles   = 5
+set engine        = phenix
+set labin         = "FP=FP SIGFP=SIGFP FREE=FreeR_flag"
+set refmac_weight = ""
+set lean          = 0
 
 foreach Arg ( $* )
   set key = `echo $Arg | awk -F= '{print $1}'`
@@ -101,6 +115,11 @@ foreach Arg ( $* )
   if("$key" == "fix_wxc")       set fix_wxc       = $val
   if("$key" == "omegas")        set omegas        = $val
   if("$key" == "omega_esd")     set omega_esd     = $val
+  if("$key" == "macrocycles")   set macrocycles   = $val
+  if("$key" == "engine")        set engine        = $val
+  if("$key" == "labin")         set labin         = `echo $Arg | cut -d= -f2- | tr ',' ' '`
+  if("$key" == "refmac_weight") set refmac_weight = $val
+  if("$key" == "lean")          set lean          = $val
 end
 if("$crowbars" == "") set crowbars = $maxadd
 if("$bonds" == "")    set bonds    = $maxadd
@@ -149,6 +168,30 @@ set omegafudge = ""
 if("$omega_esd" != "") then
   set omegaarg = "pdb_interpretation.peptide_link.omega_esd_override_value=$omega_esd"
   set omegafudge = "omega_esd=$omega_esd"
+endif
+
+if("$engine" != "phenix" && "$engine" != "refmac") then
+  echo "ERROR: engine=$engine is neither phenix nor refmac"
+  exit 1
+endif
+# refmac matches LABIN loosely (FP picked Fpart in a file holding both), so it gets an mtz with only its own columns
+if("$engine" == "refmac" && ! -e refmac_data.mtz) then
+  set cadin = `echo $labin | awk '{for(i=1;i<=NF;i++){split($i,a,"="); printf "E%d=%s ", i, a[2]}}'`
+  cad hklin1 $mtzfile hklout refmac_data.mtz << EOF >! cad_refmac.log
+labin file 1 $cadin
+EOF
+  if(! -s refmac_data.mtz) then
+    echo "ERROR: cad could not write refmac_data.mtz — see cad_refmac.log"
+    exit 1
+  endif
+endif
+
+set leanargs = ""
+if($lean) set leanargs = "electron_density_maps.apply_default_maps=False output.write_mtz_file=False output.write_model_cif_file=False output.write_def_file=False"
+
+# (a one-line if would redirect even when false, emptying a saved weight)
+if("$engine" == "refmac" && "$refmac_weight" != "" && ! -e refmac_weight.txt) then
+  echo $refmac_weight >! refmac_weight.txt
 endif
 
 # -----------------------------------------------------------------------
@@ -297,16 +340,49 @@ foreach x ( `seq 1 $maxcycles` )
   if($fixweights) set weightargs = `awk -v s=$wxc_now '{print "target_weights.fix_wxc=" $1*s, "target_weights.fix_wxu=" $2}' fixed_weights.txt`
   if($fixweights && "$fix_wxc" != "") set weightargs = `awk -v x=$fix_wxc -v s=$wxc_now -v w=$wxc '{print "target_weights.fix_wxc=" x*s/w, "target_weights.fix_wxu=" $2}' fixed_weights.txt`
 
-  $PHENIXRUN $startpdb $mtzfile \
-    prefix=${prefix} serial=${num} \
-    $ssargs noocc.eff \
-    wxc_scale=${wxc_now} wxu_scale=${wxu} $targetarg $omegaarg $weightargs \
-    main.number_of_macro_cycles=5 cdl=${cdl} \
-    write_geo_file=True \
-    phenix_holdme.eff phenix_fudge.eff >! phenix_${num}.log
-  if($status) then
-    echo "phenix.refine failed at iteration $num — stopping"
-    break
+  if("$engine" == "refmac") then
+    # Val1 H1 renamed and LINK records dropped, as for the final REFMAC step;
+    # the first iteration uses refmac's automatic weight, later ones that times wxc
+    awk '/H1 .VAL .   1 /{gsub("  H1 ","  H  ")} {print}' $startpdb | egrep -v LINK >! refmac_in.pdb
+    # "altecode _" (no altloc) makes refmac look for altloc "_" and stop
+    sed 's/ altecode _//g' refmac_opts.txt >! refmac_opts_refmac.txt
+    set weightline = "weight auto"
+    if(-s refmac_weight.txt) set weightline = "weight matrix `cat refmac_weight.txt`"
+    refmac5 xyzin refmac_in.pdb xyzout ${prefix}_${num}.pdb \
+      hklin refmac_data.mtz hklout ${prefix}_${num}.mtz << EOF >! refmac_${num}.log
+labin $labin
+make hydr Y
+make hout Y
+ncyc $macrocycles
+refi bref iso
+$weightline
+@refmac_opts_refmac.txt
+end
+EOF
+    if($status) then
+      echo "refmac5 failed at iteration $num — stopping"
+      break
+    endif
+    if(! -s refmac_weight.txt) then
+      awk -v s=$wxc_now '/Weight matrix/{w=$NF} END{if(w+0>0) print w*s}' refmac_${num}.log >! refmac_weight.txt
+      if(! -s refmac_weight.txt) then
+        echo "ERROR: no 'Weight matrix' in refmac_${num}.log to scale"
+        break
+      endif
+      echo "refmac matrix weight from iteration $num times ${wxc_now}: `cat refmac_weight.txt`"
+    endif
+  else
+    $PHENIXRUN $startpdb $mtzfile \
+      prefix=${prefix} serial=${num} \
+      $ssargs noocc.eff \
+      wxc_scale=${wxc_now} wxu_scale=${wxu} $targetarg $omegaarg $weightargs \
+      main.number_of_macro_cycles=${macrocycles} cdl=${cdl} \
+      write_geo_file=True $leanargs \
+      phenix_holdme.eff phenix_fudge.eff >! phenix_${num}.log
+    if($status) then
+      echo "phenix.refine failed at iteration $num — stopping"
+      break
+    endif
   endif
   # NFS cache may lag after srun returns; wait up to 60s for the file to appear
   set _wait = 0
@@ -361,7 +437,7 @@ foreach x ( `seq 1 $maxcycles` )
   ${scriptdir}/reweight_opts_runme.com maxadd=$maxadd
   cp refmac_opts_new.txt refmac_opts.txt
 
-  if($fudgeify) then
+  if($fudgeify && "$engine" == "phenix") then
     python3 ${scriptdir}/fudgeify.py ${prefix}_${num}_fullgeo.txt \
       maxadd=$maxadd crowbars=$crowbars bonds=$bonds angles=$angles \
       torsions=$torsions planes=$planes omegas=$omegas $omegafudge outfile=phenix_fudge.eff $overridearg \
