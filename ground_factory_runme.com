@@ -30,9 +30,13 @@
 #     bonds=N angles=N torsions=N planes=N
 #                        with fudgeify, outliers of that kind restrained per
 #                        cycle (default maxadd; torsions include CB deviations)
-#     cdl=False         phenix conformation-dependent library, in refinement and
-#                        in molprobify scoring.  CDL rewrites backbone bond
-#                        restraints every macro-cycle, undoing edits to them
+#     cdl=True           phenix conformation-dependent library, in refinement and
+#                        in molprobify scoring (the Challenge scorer uses CDL).
+#                        CDL rewrites backbone bond restraints every macro-cycle,
+#                        so with it on, edits to their sigmas do nothing
+#     cdl_interp=1       CDL ideals interpolated between phi/psi bins (phenix's
+#                        "slow mode", via cdl_interp.py), in refinement and in
+#                        molprobify; 0 = binned, as the Challenge scorer
 #     fixweights=1       phenix's X-ray weights wxc and wxu fixed at their
 #                        averages in iteration 001 (then scaled by wxc and wxu),
 #                        with the ml target in every macro-cycle; 0 = phenix
@@ -78,7 +82,8 @@ set bonds         = ""
 set angles        = ""
 set torsions      = ""
 set planes        = ""
-set cdl           = False
+set cdl           = True
+set cdl_interp    = 1
 set fixweights    = 1
 set fix_wxc       = ""
 set omegas        = ""
@@ -111,6 +116,7 @@ foreach Arg ( $* )
   if("$key" == "torsions")      set torsions      = $val
   if("$key" == "planes")        set planes        = $val
   if("$key" == "cdl")           set cdl           = $val
+  if("$key" == "cdl_interp")    set cdl_interp    = $val
   if("$key" == "fixweights")    set fixweights    = $val
   if("$key" == "fix_wxc")       set fix_wxc       = $val
   if("$key" == "omegas")        set omegas        = $val
@@ -155,7 +161,8 @@ endif
 echo "$thishost $$" >! ground_factory.lock
 
 set PHENIXRUN = "phenix.refine"
-if($srun) set PHENIXRUN = "srun -p debug phenix.refine"
+if($cdl_interp) set PHENIXRUN = "phenix.python ${scriptdir}/cdl_interp.py phenix.command_line.phenix_refine"
+if($srun) set PHENIXRUN = "srun -p debug $PHENIXRUN"
 
 # phenix's default target is least-squares for the first two macro-cycles and
 # ml after, and its weights differ ~10x between them, so one fixed weight
@@ -261,7 +268,7 @@ if(-s overrides.txt) set overridearg = "overridefile=overrides.txt"
 echo "=== Validating starting model ==="
 mkdir -p this start
 if(! -e start/refmac_opts_debump.txt) then
-  ${scriptdir}/molprobify_runme.com $pdbfile keepgeo=1 writefudge=1 cdl=${cdl} $overridearg
+  ${scriptdir}/molprobify_runme.com $pdbfile keepgeo=1 writefudge=1 cdl=${cdl} cdl_interp=${cdl_interp} $overridearg
   cp refmac_opts_de*.txt refmac_opts_fix*.txt start/
 endif
 
@@ -401,7 +408,7 @@ EOF
   # its refmac_opts_*.txt proposals
   set moltempfile = /dev/shm/${USER}/gf_${num}_
   ${scriptdir}/molprobify_runme.com ${prefix}_${num}.pdb keepgeo=1 writefudge=1 debug=1 \
-    tempfile=${moltempfile} cdl=${cdl} \
+    tempfile=${moltempfile} cdl=${cdl} cdl_interp=${cdl_interp} \
     $overridearg | tee molprobify_${num}.log
 
   set energy = `grep -a "weighted energy" molprobify_${num}.log | tail -n 1 | awk '{print $NF}'`
@@ -481,7 +488,7 @@ cp refmac_opts_beforefinal.txt refmac_opts.txt
 cp refmacout.pdb fmodelme.pdb
 
 echo "=== Final validation ==="
-${scriptdir}/molprobify_runme.com fmodelme.pdb keepgeo=1 cdl=${cdl} $overridearg | tee molprobify_fmodelme.log
+${scriptdir}/molprobify_runme.com fmodelme.pdb keepgeo=1 cdl=${cdl} cdl_interp=${cdl_interp} $overridearg | tee molprobify_fmodelme.log
 
 # -----------------------------------------------------------------------
 # Step 6: Ideal structure factors

@@ -10,9 +10,12 @@ Each call is one ground_factory cycle: the worst maxadd outliers of each type
 are added or tightened (sigma/1.5, down to the floors reweight_opts uses), and
 every other entry is relaxed (sigma*1.01); NONBOND and BOND entries are
 dropped once relaxed to sigma 5.  A new BOND, ANGLE or TORSION entry changes
-phenix's own restraint, so it starts at natural sigma/1.5.  Changes to
-backbone bonds only take effect with phenix's CDL off (ground_factory
-cdl=False): CDL rewrites them every macro-cycle.
+phenix's own restraint, so it starts at natural sigma/1.5.  Every cycle, each
+BOND and ANGLE entry takes the scorer's current ideal from fullgeo: with CDL
+on, backbone ideals follow phi/psi, so an entry keeps the value the model is
+scored against now, not the one it had when it was added.  phenix's CDL still
+rewrites backbone bonds every macro-cycle, so with CDL on their sigma changes
+do nothing; edited angles stay.
 
 Contacts get crowbars (NONBOND entries): a bond that only pushes, from dmin
 out to dmin+2 (distance_ideal dmin+1, slack 1).  The worst probe clashes
@@ -746,6 +749,44 @@ def load_table(table_path):
 # which can get as tight as a torsion before they are lengthened
 FLOORS = {"NONBOND": 0.01, "BOND": 0.001, "ANGLE": 0.01, "TORSION": 0.01, "PLANE": 0.001}
 
+def load_ideals(fullgeo_path):
+    """The scorer's ideal for every bond and angle in fullgeo, keyed like
+    entry_key in either atom order (symmetry contacts left out)."""
+    ideals = {}
+    with open(fullgeo_path) as f:
+        for line in f:
+            if "|" not in line:
+                continue
+            head, pipe = line.rstrip().split("|", 1)
+            w = head.split()
+            if len(w) < 5 or w[0] not in ("BOND", "ANGLE") or "symop=" in pipe:
+                continue
+            try:
+                ideal = float(w[4])
+            except ValueError:
+                continue
+            n = 2 if w[0] == "BOND" else 3
+            atoms = parse_atom_specs(pipe)[:n]
+            if len(atoms) < n:
+                continue
+            for order in (atoms, atoms[::-1]):
+                ideals[" ".join([w[0]] + [x for a in order for x in a])] = ideal
+    return ideals
+
+def refresh_ideals(entries, ideals):
+    """Give each BOND and ANGLE entry the scorer's current ideal.  Returns how
+    many changed."""
+    nchanged = 0
+    for fields, attrs in entries:
+        if fields[0] not in ("BOND", "ANGLE") or attrs.get("sym"):
+            continue
+        vi = 9 if fields[0] == "BOND" else 13
+        ideal = ideals.get(" ".join(fields[:vi]))
+        if ideal is not None and abs(float(fields[vi]) - ideal) >= 0.00005:
+            fields[vi] = f"{ideal:.4f}"
+            nchanged += 1
+    return nchanged
+
 def tighten(fields, sig):
     """sigma/1.5, not below the floor for its type, and never looser."""
     return max(sig / 1.5, min(sig, FLOORS.get(fields[0], 0.001)))
@@ -959,8 +1000,9 @@ def main():
                                 ("OMEGA", args.omegas)) if n >= 0}
     # a CB deviation is a pair of pseudo-dihedrals, counted against the torsion limit
     limits["CBDEV"] = 2 * limits.get("TORSION", args.maxadd)
-    new_entries, ntightened, nlengthened, nadded = accumulate(proposals, load_table(args.table),
-                                                             args.maxadd, limits)
+    table = load_table(args.table)
+    nrefreshed = refresh_ideals(table, load_ideals(args.fullgeo))
+    new_entries, ntightened, nlengthened, nadded = accumulate(proposals, table, args.maxadd, limits)
 
     write_table(new_entries, args.table)
     write_phenix(new_entries, args.outfile, dihedrals)
@@ -969,7 +1011,8 @@ def main():
 
     ncrowbars = sum(1 for fields, attrs in new_entries if fields[0] == "NONBOND")
     print(f"fudgeify: wrote {args.outfile} from {args.fullgeo} ({len(new_entries)} table entries,"
-          f" {nadded} added, {ntightened} tightened, {nlengthened} crowbars lengthened)")
+          f" {nadded} added, {ntightened} tightened, {nlengthened} crowbars lengthened,"
+          f" {nrefreshed} ideals updated)")
     worst = ""
     if close:
         worst = f"; worst {' '.join(close[0][2].split('|', 1)[1].split())} (energy {close[0][0]:g})"

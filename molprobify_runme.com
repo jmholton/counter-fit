@@ -75,6 +75,8 @@ set keepgeo = 0
 set csda = 0.6
 # phenix conformation-dependent library for backbone bond and angle ideals
 set cdl = True
+# 1: CDL ideals interpolated between phi/psi bins (cdl_interp.py); 0 = phenix's default, as the Challenge scorer
+set cdl_interp = 0
 # sigma of omega
 set sigomega = 4.01398721805631
 
@@ -116,6 +118,10 @@ foreach arg ( $* )
     if("$arg" == "debug") set debug = 1
 end
 
+set scriptdir = `dirname $0`
+set scriptdir = `cd $scriptdir && pwd`
+set geomin = phenix.geometry_minimization
+if("$cdl_interp" == "1") set geomin = ( phenix.python ${scriptdir}/cdl_interp.py mmtbx.command_line.geometry_minimization )
 
 # check for dependencies
 set test = `gnuplot --version | grep "gnuplot " | grep -v "Command not found" |wc -l`
@@ -284,7 +290,7 @@ phenix.molprobity flip_symmetric_amino_acids=True $ciffiles \
 cp ${tmpdir}/molprobity_coot.py ${t}molprobity_coot.py
 
 echo "geometry"
-phenix.geometry_minimization $pdbfile $ciffiles macro_cycles=0 \
+$geomin $pdbfile $ciffiles macro_cycles=0 \
   stop_for_unknowns=false \
   allow_polymer_cross_special_position=True \
   const_shrink_donor_acceptor=$csda cdl=$cdl \
