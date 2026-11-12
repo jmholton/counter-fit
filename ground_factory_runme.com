@@ -30,13 +30,15 @@
 #     bonds=N angles=N torsions=N planes=N
 #                        with fudgeify, outliers of that kind restrained per
 #                        cycle (default maxadd; torsions include CB deviations)
-#     cdl=True           phenix conformation-dependent library, in refinement and
-#                        in molprobify scoring (the Challenge scorer uses CDL).
-#                        CDL rewrites backbone bond restraints every macro-cycle,
-#                        so with it on, edits to their sigmas do nothing
+#     cdl=True           phenix conformation-dependent library in molprobify
+#                        scoring (the Challenge scorer uses CDL)
 #     cdl_interp=1       CDL ideals interpolated between phi/psi bins (phenix's
-#                        "slow mode", via cdl_interp.py), in refinement and in
-#                        molprobify; 0 = binned, as the Challenge scorer
+#                        "slow mode", via cdl_interp.py); 0 = binned, as the
+#                        Challenge scorer
+#     refine_cdl=False   CDL in phenix.refine.  CDL rewrites backbone bond
+#                        restraints every macro-cycle, undoing edits to them, so
+#                        it stays off: fudgeify instead gives refinement the
+#                        scorer's bond and angle targets every cycle
 #     fixweights=1       phenix's X-ray weights wxc and wxu fixed at their
 #                        averages in iteration 001 (then scaled by wxc and wxu),
 #                        with the ml target in every macro-cycle; 0 = phenix
@@ -84,6 +86,7 @@ set torsions      = ""
 set planes        = ""
 set cdl           = True
 set cdl_interp    = 1
+set refine_cdl    = False
 set fixweights    = 1
 set fix_wxc       = ""
 set omegas        = ""
@@ -117,6 +120,7 @@ foreach Arg ( $* )
   if("$key" == "planes")        set planes        = $val
   if("$key" == "cdl")           set cdl           = $val
   if("$key" == "cdl_interp")    set cdl_interp    = $val
+  if("$key" == "refine_cdl")    set refine_cdl    = $val
   if("$key" == "fixweights")    set fixweights    = $val
   if("$key" == "fix_wxc")       set fix_wxc       = $val
   if("$key" == "omegas")        set omegas        = $val
@@ -161,7 +165,9 @@ endif
 echo "$thishost $$" >! ground_factory.lock
 
 set PHENIXRUN = "phenix.refine"
-if($cdl_interp) set PHENIXRUN = "phenix.python ${scriptdir}/cdl_interp.py phenix.command_line.phenix_refine"
+# interpolated CDL in refinement only matters with CDL on there
+set refine_cdl_on = `echo $refine_cdl | awk '{print (tolower($1)=="true" || $1=="1")}'`
+if($cdl_interp && $refine_cdl_on) set PHENIXRUN = "phenix.python ${scriptdir}/cdl_interp.py phenix.command_line.phenix_refine"
 if($srun) set PHENIXRUN = "srun -p debug $PHENIXRUN"
 
 # phenix's default target is least-squares for the first two macro-cycles and
@@ -278,7 +284,7 @@ if(! -e default.geo) then
     prefix=${prefix} serial=001 \
     $ssargs noocc.eff \
     wxc_scale=${wxc} wxu_scale=${wxu} $targetarg $omegaarg \
-    main.number_of_macro_cycles=5 cdl=${cdl} \
+    main.number_of_macro_cycles=5 cdl=${refine_cdl} \
     write_geo_file=True \
     phenix_holdme.eff phenix_fudge.eff >! phenix_001.log
   if($status) then
@@ -383,7 +389,7 @@ EOF
       prefix=${prefix} serial=${num} \
       $ssargs noocc.eff \
       wxc_scale=${wxc_now} wxu_scale=${wxu} $targetarg $omegaarg $weightargs \
-      main.number_of_macro_cycles=${macrocycles} cdl=${cdl} \
+      main.number_of_macro_cycles=${macrocycles} cdl=${refine_cdl} \
       write_geo_file=True $leanargs \
       phenix_holdme.eff phenix_fudge.eff >! phenix_${num}.log
     if($status) then

@@ -12,10 +12,13 @@ every other entry is relaxed (sigma*1.01); NONBOND and BOND entries are
 dropped once relaxed to sigma 5.  A new BOND, ANGLE or TORSION entry changes
 phenix's own restraint, so it starts at natural sigma/1.5.  Every cycle, each
 BOND and ANGLE entry takes the scorer's current ideal from fullgeo: with CDL
-on, backbone ideals follow phi/psi, so an entry keeps the value the model is
-scored against now, not the one it had when it was added.  phenix's CDL still
-rewrites backbone bonds every macro-cycle, so with CDL on their sigma changes
-do nothing; edited angles stay.
+on in scoring, backbone ideals follow phi/psi, so an entry keeps the value the
+model is scored against now, not the one it had when it was added.  Every
+other bond and angle whose scorer ideal or sigma differs from phenix's own
+(default.geo, refinement with CDL off) gets an edit with the scorer's values,
+rebuilt each cycle and not kept in the table, so refinement aims at what is
+scored.  Refinement needs CDL off for this (ground_factory refine_cdl=False):
+phenix's CDL rewrites backbone bonds every macro-cycle, undoing their edits.
 
 Contacts get crowbars (NONBOND entries): a bond that only pushes, from dmin
 out to dmin+2 (distance_ideal dmin+1, slack 1).  The worst probe clashes
@@ -773,6 +776,73 @@ def load_ideals(fullgeo_path):
                 ideals[" ".join([w[0]] + [x for a in order for x in a])] = ideal
     return ideals
 
+def load_geo_ideals(geo_path):
+    """Ideal and sigma of every bond and angle phenix restrains in refinement,
+    from a phenix .geo file, keyed like entry_key in either atom order
+    (symmetry bonds left out)."""
+    out = {}
+    if not geo_path or not os.path.exists(geo_path):
+        return out
+    with open(geo_path) as f:
+        lines = iter(f)
+        for line in lines:
+            if line.startswith("bond pdb="):
+                t, n = "BOND", 2
+            elif line.startswith("angle pdb="):
+                t, n = "ANGLE", 3
+            else:
+                continue
+            ids = [line] + [next(lines, "") for i in range(n - 1)]
+            atoms = []
+            for s in ids:
+                w = s.split('"')
+                if len(w) < 2 or len(w[1]) < 15:
+                    break
+                pid = w[1]
+                atoms.append((blank(pid[9]), pid[10:15].strip(), pid[0:4].strip(), blank(pid[4])))
+            header = next(lines, "")
+            values = next(lines, "").split()
+            if len(atoms) < n or "sym" in header or len(values) < 4:
+                continue
+            try:
+                ideal, sigma = float(values[0]), float(values[3])
+            except ValueError:
+                continue
+            for order in (atoms, atoms[::-1]):
+                out[" ".join([t] + [x for a in order for x in a])] = (ideal, sigma)
+    return out
+
+def scorer_targets(fullgeo_path, refine_ideals, table_keys):
+    """BOND and ANGLE edits that give phenix the scorer's ideal and sigma
+    wherever they differ from its own (CDL on in scoring and off in refinement:
+    the backbone), except those the table already edits.  Rebuilt every cycle,
+    not kept in the table."""
+    targets = []
+    with open(fullgeo_path) as f:
+        for line in f:
+            if "|" not in line:
+                continue
+            head, pipe = line.rstrip().split("|", 1)
+            w = head.split()
+            if len(w) < 6 or w[0] not in ("BOND", "ANGLE") or "symop=" in pipe:
+                continue
+            n = 2 if w[0] == "BOND" else 3
+            atoms = parse_atom_specs(pipe)[:n]
+            if len(atoms) < n or not all(is_heavy(a[2]) for a in atoms):
+                continue
+            key = " ".join([w[0]] + [x for a in atoms for x in a])
+            if key in table_keys or key not in refine_ideals:
+                continue
+            try:
+                ideal, sigma = float(w[4]), float(w[5])
+            except ValueError:
+                continue
+            r_ideal, r_sigma = refine_ideals[key]
+            tol = 0.0005 if w[0] == "BOND" else 0.05
+            if abs(ideal - r_ideal) > tol or abs(sigma - r_sigma) > 0.01 * r_sigma:
+                targets.append(([w[0]] + [x for a in atoms for x in a] + [f"{ideal:.4f}", f"{sigma:.6f}"], {}))
+    return targets
+
 def refresh_ideals(entries, ideals):
     """Give each BOND and ANGLE entry the scorer's current ideal.  Returns how
     many changed."""
@@ -1005,14 +1075,22 @@ def main():
     new_entries, ntightened, nlengthened, nadded = accumulate(proposals, table, args.maxadd, limits)
 
     write_table(new_entries, args.table)
-    write_phenix(new_entries, args.outfile, dihedrals)
+    table_keys = set()
+    for fields, attrs in new_entries:
+        if fields[0] in ("BOND", "ANGLE") and not attrs.get("sym"):
+            n = 9 if fields[0] == "BOND" else 13
+            atoms = [fields[i:i + 4] for i in range(1, n, 4)]
+            for order in (atoms, atoms[::-1]):
+                table_keys.add(" ".join([fields[0]] + [x for a in order for x in a]))
+    targets = scorer_targets(args.fullgeo, load_geo_ideals(args.geo), table_keys)
+    write_phenix(new_entries + targets, args.outfile, dihedrals)
     listed, close = watch_crowbars(new_entries, neighbours, contacts,
                                    args.watch or prefix + "_crowbars.txt", args.sigma_fudge)
 
     ncrowbars = sum(1 for fields, attrs in new_entries if fields[0] == "NONBOND")
     print(f"fudgeify: wrote {args.outfile} from {args.fullgeo} ({len(new_entries)} table entries,"
           f" {nadded} added, {ntightened} tightened, {nlengthened} crowbars lengthened,"
-          f" {nrefreshed} ideals updated)")
+          f" {nrefreshed} ideals updated, {len(targets)} scorer targets)")
     worst = ""
     if close:
         worst = f"; worst {' '.join(close[0][2].split('|', 1)[1].split())} (energy {close[0][0]:g})"

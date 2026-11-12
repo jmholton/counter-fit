@@ -42,10 +42,11 @@ ground_factory_runme.com  model.pdb  data.mtz  [options]
                      with fudgeify, outliers of that kind restrained per cycle
                      (default maxadd; torsions include CB deviations, planes
                      include the impropers that stand in for peptide planes)
-  cdl=True           phenix conformation-dependent library, in refinement and
-                     in molprobify scoring (CDL undoes backbone bond edits)
-  cdl_interp=1       CDL ideals interpolated between phi/psi bins, in
-                     refinement and in molprobify (cdl_interp.py); 0 = binned
+  cdl=True           phenix conformation-dependent library in molprobify scoring
+  cdl_interp=1       CDL ideals interpolated between phi/psi bins
+                     (cdl_interp.py); 0 = binned, as the Challenge scorer
+  refine_cdl=False   CDL in phenix.refine (CDL undoes backbone bond edits, so
+                     fudgeify passes the scorer's targets on instead)
   fixweights=1       fix phenix's X-ray weights at iteration 001's values
                      (see below); 0 = phenix recomputes them every macro-cycle
   fix_wxc=X          with fixweights=1, pass X as fix_wxc instead of iteration
@@ -211,26 +212,30 @@ instead by an improper dihedral on the same 4 atoms (0 or 180°, sigma =
 the plane's sigma over the 4th atom's distance from the dihedral axis, in
 degrees), which is the only way 4 atoms leave a plane.
 
-phenix's conformation-dependent library is on by default (`cdl=True`), as in
-the Challenge scorer; molprobify scores with the same setting, so refinement
-and wE use the same ideal values.  CDL makes backbone ideals depend on
-phi/psi, so every cycle each BOND and ANGLE entry takes the scorer's current
-ideal from fullgeo rather than keeping the value it had when it was added.
-CDL also sets the C–N, N–CA, CA–CB, CA–C and C–O bonds from phi/psi after the
-edits are applied, and again every macro-cycle, so with CDL on a sigma change
-to one of those bonds does nothing; CDL leaves edited angles alone.  Runs
-before 12 Nov 2026 used `cdl=False`, so their wE is not the Challenge
-scorer's.  Bonds between symmetry mates are not changed.
+molprobify scores with phenix's conformation-dependent library on
+(`cdl=True`), as the Challenge scorer does, and by default interpolated
+(`cdl_interp=1`, below).  Refinement runs with CDL off (`refine_cdl=False`):
+CDL sets the C–N, N–CA, CA–CB, CA–C and C–O bonds from phi/psi after the
+edits are applied, and again every macro-cycle, so with CDL on in refinement
+an edit to one of those bonds does nothing.  Instead fudgeify passes the
+scorer's targets on: every cycle each BOND and ANGLE entry takes the scorer's
+current ideal from fullgeo, and every other bond and angle whose scorer ideal
+or sigma differs from phenix's own (`default.geo`) gets an edit with the
+scorer's values, rebuilt each cycle.  So refinement aims at the CDL targets
+of the model's current phi/psi.  Runs before 12 Nov 2026 scored with
+`cdl=False`, so their wE is not the Challenge scorer's.  Bonds between
+symmetry mates are not changed.
 
 phenix takes CDL ideals from the phi/psi bin a residue is in, so they jump at
 bin edges.  `mmtbx.conformation_dependent_library.update_restraints` can
 interpolate between bins instead (`interpolate=True`), but phenix exposes no
 parameter for it, so `cdl_interp.py` turns it on and then runs the program:
 `phenix.python cdl_interp.py phenix.command_line.phenix_refine …` (or
-`mmtbx.command_line.geometry_minimization`).  ground_factory uses it for
-phenix.refine and passes `cdl_interp=1` to molprobify, which uses it for
-geometry_minimization.  molprobify on its own defaults to `cdl_interp=0`, as
-the Challenge scorer (`~/Develop/molprobify_runme.com`) does.
+`mmtbx.command_line.geometry_minimization`).  ground_factory passes
+`cdl_interp=1` to molprobify, which uses it for geometry_minimization, and
+uses it for phenix.refine only with `refine_cdl=True`.  molprobify on its
+own defaults to `cdl_interp=0`, as the Challenge scorer
+(`~/Develop/molprobify_runme.com`) does.
 
 Crowbars between symmetry mates keep the operator (`sym=` in the table,
 `symmetry_operation` in the eff).  A torsion phenix already restrains
