@@ -42,8 +42,42 @@
 #   omega twist: energy=((sin(omega)/0.07)^2+(1+cos(omega))^10)/(proxPRO*2+1)
 #      where proxPRO means a neighboring residue is proline
 #
-#   allow "override" file    
+#   allow "override" file
 #
+#  ---------------------------------------------------------------------------------------------------------------------
+#  molprobify_v2.com (claude_numbers session, 2026-10-22, at JH's request): a copy of ~/Develop/molprobify_runme.com
+#  (md5 da46cf17cac3434eed847a8a5ec4d83f) with the three revisions of the weighted energy (wE):
+#
+#  1. ALL outliers are aggregated, not only the single worst of each category: every item i of a category of N items
+#     contributes Pnn(z_i, N) * softened energy (energy > 10 -> 10+ln(energy/10), as before), where
+#     Pnn(z, N) = erf(z/sqrt(2))**N is the probability-not-noise the old score applied to the worst item only.  The old
+#     softPnna approximation (pnn=soft) is NOT used by default: it is far too heavy at small deviates (best.pdb: 208 of
+#     628 torsions get weight > 0.01, wE 112 vs 26 exact).  Categories: bond, angle, torsion,
+#     chiral, plane, omega, rama, rota, CBdev.  The average (chi-square) terms are kept as before.
+#     (Rejected: weighting the k-th largest by 1 - P(Binomial(N,p) >= k); for a pure-noise sample that is ~0.5 for every
+#     k, so it charges half the category's total energy.)
+#  2. C-beta deviations are scored as the 3D distances they are: x = dev/cbsigma is a chi deviate with cbdof degrees of
+#     freedom (3: Maxwell; 2: Rayleigh), converted to the Gaussian deviate with the same tail probability,
+#        P_chi3(>x) = erfc(x/sqrt(2)) + sqrt(2/pi) x exp(-x^2/2);   z = -invnorm(P/2);   energy = z^2
+#     instead of energy = (dev/0.05)^2.  cbsigma is the per-component sigma, calibrated from observed variation:
+#     0.032 A = rms/sqrt(3) of the 57,000 C-beta deviations of the 500 truth re-refinements (rms distance 0.0556 A).
+#  3. Non-bonds: no N = number of repulsive contacts (the NONBOND-n flaw).  Default (nbmode=occ): as nbmode=bonds below but
+#     occupancy-weighted where altlocs would double-count: N = total atom occupancy (nbN=occ) or the occupancy-weighted
+#     number of contacts within 1.2x the vdW distance (nbN=vdw120), and the average term sum(w*LJ>0)/N with
+#     w = min(occ_a, occ_b).  Outlier items keep the unweighted LJ (nboutw=1 weights them too).
+#     nbmode=bonds: each repulsive contact's
+#     LJ energy (well depths) is used as a z^2-type energy and aggregated with Pnn(sqrt(LJ), N_bonds), N_bonds = number of
+#     non-H bonds (fixed by the covalent structure); the average term is sum(LJ>0)/N_bonds with the usual chi-square weight.
+#     Alternative (nbmode=stat): every contact is an item of the aggregated outlier term with N = all contacts; a repulsive contact's
+#     LJ energy (v1's lj(), in well depths) is converted to the tail probability p = nbP0 exp(-nbk LJ) calibrated on correct
+#     models, then to z and energy z^2 like rama/rota.  nbmode=physical instead adds the sum over contacts of the repulsive LJ
+#     energy (each softened above 10) with no weight; nbmode=both adds both.
+#  4. Rama/rota: probability p (fraction of good structures at least this unusual) to Z-score by the usual two-sided
+#     relationship p = erfc(z/sqrt(2)), energy = z^2 = 2*inverf(1-p)^2.  (v1 used inverf(1-p)^2 = z^2/2.)
+#  Unchanged: everything else, including the probe CLASH term (worst clash x count, as before; it double-counts contacts
+#  that the nonbond energy also charges, deliberately).
+#  Extra output: ${outprefix}_v2terms.txt (per-category breakdown), ${outprefix}_v2items.txt (every weighted item).
+#  ---------------------------------------------------------------------------------------------------------------------
 
 set pdbfile = ""
 set mtzfile = ""
@@ -79,6 +113,23 @@ set cdl = True
 set cdl_interp = 0
 # sigma of omega
 set sigomega = 4.01398721805631
+# v2: per-component sigma (A) and degrees of freedom of the C-beta deviation distance
+set cbsigma = 0.032
+set cbdof = 3
+# v2: weight of each aggregated item: exact = erf(z/sqrt(2))**N (default), soft = the old softPnna
+set pnn = exact
+# v2 nonbond: nbmode = occ (default: energy = w*LJ with w = min(occ_a,occ_b), N = nbN (occ: total atom occupancy, default;
+# vdw120 / vdw100: occupancy-weighted number of contacts within 1.2x / 1.0x the vdW distance); outlier aggregate + average term
+# sum(w*LJ>0)/N), bonds (energy = LJ, N = number of non-H bonds),
+# stat (each contact's LJ -> calibrated tail probability -> z^2, N = all contacts), physical (sum of repulsive LJ), both.  Tail of contact LJ in correct models: P(LJ' >= LJ) = nbP0 exp(-nbk LJ),
+# nbP0 = fraction of contacts with LJ > 0 and nbk set so that the median worst contact of a correct model (LJ 5.77) has Pnn 0.5
+# (truth + 20 truth re-refinements, 649,611 contacts; claude_numbers/wE_v2/nbcal/nbtail.py)
+set nbmode = occ
+set nbN = occ
+# v2: nboutw=1 weights nonbond OUTLIER items by occupancy too (default 0: only N and the average term are occupancy-weighted)
+set nboutw = 0
+set nbP0 = 1.045e-3
+set nbk = 0.667
 
 # flag to debug things
 set debug = 0
@@ -421,11 +472,19 @@ awk -v modulo=$modulo -v sigomega=$sigomega 'BEGIN{RTD=45/atan2(1,1);sigom=sigom
 sort -k2gr >! ${t}_allomegas.txt
 
 
-# this is in Angstrom, assume "sigma" of 0.05 A
+# this is in Angstrom
+# v2: the deviation is a 3D distance: x = dev/cbsigma is a chi(cbdof) deviate; energy = square of the Gaussian deviate
+#     with the same (two-sided) tail probability.  (v1: energy=(dev/0.05)^2, i.e. a signed 1D Gaussian deviate.)
 cat ${outprefix}_cbetadev.log |\
- awk -v modulo=$modulo -F ":" '! /^SUMM|^pdb/{energy=($6/0.05)^2;\
+ awk -v modulo=$modulo -v cbsigma=$cbsigma -v cbdof=$cbdof -F ":" '! /^SUMM|^pdb/ && NF>5{x=$6/cbsigma;\
    n=($5-1)%modulo+1;\
-   print "CBETADEV",energy,n,$0}' |\
+   if(cbdof==2){Q="exp(-"x"**2/2.0)"}else{Q="(erfc("x"/sqrt(2.0))+sqrt(2.0/pi)*"x"*exp(-"x"**2/2.0))"};\
+   arg="(-invnorm("Q"/2.0))**2";\
+   if(x>37)arg=x*x;\
+   gsub("\"","",$0);\
+   print "print "arg", \" "n" "$0"\""}' |\
+gnuplot |&\
+awk '{$1+=0;print "CBETADEV",$0}' |\
 sort -k2gr >! ${t}_cbetadev.txt
 # CBETADEV energy resnum%modulo otherstuff
 
@@ -437,7 +496,7 @@ cat ${outprefix}_rotalyze.log |\
    n=(substr($0,3,4)-1)%modulo+1;\
    P=1-$3/100;\
    pP=sprintf("%.35g",P-1e-16);\
-   arg="inverf("pP")**2";\
+   arg="2*inverf("pP")**2";\
    if(sprintf("%g",P)+0==1)arg=99;\
    print "print "arg", \"",n,$0,P+0,"\""}' |\
 gnuplot |&\
@@ -449,7 +508,7 @@ cat ${outprefix}_ramalyze.log  |\
    n=(substr($0,3,4)-1)%64+1;\
    P=1-$2/100;\
    pP=sprintf("%.35g",P-1e-16);\
-   arg="inverf("pP")**2";\
+   arg="2*inverf("pP")**2";\
    if(sprintf("%g",P)+0==1)arg=99;\
    print "print "arg", \"",n,$0,P,"\""}' |\
 gnuplot |&\
@@ -804,7 +863,35 @@ chisq(x,k) = (k<1?0:(k<3200?igamma(k/2.0,x/2.0):chisqhi(x,k)))
 chisqhi(x,k) = erf((sqrt(x)-sqrt(k)))/2+0.5
 EOF
 
-cat ${t}_avgs.txt ${t}_worsts.txt |\
+# v2: the chi-square average terms (all but nonbond) and the clash term go through the old machinery;
+#     the single-worst terms of the other categories are replaced by the aggregate below, nonbond by its energy
+egrep -v "avg_nonbond|avg_full_nonbond" ${t}_avgs.txt >! ${t}_avgs_v2.txt
+# nbmode=bonds: nonbond average term = sum of repulsive LJ per (non-H) bond, chi-square weight with N = number of bonds
+set nbonds = `awk '/^BOND/{++n} END{print n+0}' ${t}_geo.txt`
+if( "$nbmode" == "bonds" ) then
+  awk -v nb=$nbonds '/^NONBOND/ && $2>0{s+=$2} END{if(nb>0)print s/nb,nb,"avg_nonbond"}' ${t}_geo.txt >> ${t}_avgs_v2.txt
+endif
+# nbmode=occ (default): occupancy-weighted contacts.  w = min(occ_a, occ_b) (probability both atoms are present; a same-conformer
+# altloc pair at 0.5/0.5 counts 0.5), energy w*LJ.  N (nbN): occ = total atom occupancy; vdw120 = sum of w over contacts within
+# 1.2 x vdW distance (~3.3 per unit occupancy in 1aho models); vdw100 = within the vdW distance (~0.37).
+# ${t}_nbw.txt: w LJ obs/ideal ; last line TOTOCC sum(occ)
+awk 'FILENAME==ARGV[1]{if($0!~/^ATOM|^HETATM/)next;\
+   nm=substr($0,13,4);gsub(" ","",nm);al=substr($0,17,1);if(al==" ")al="_";\
+   rn=substr($0,18,3);gsub(" ","",rn);ch=substr($0,22,1);if(ch==" ")ch="_";rs=substr($0,23,4)+0;\
+   o=substr($0,55,6)+0;occ[nm" "al" "rn" "ch" "rs]=o;tot+=o;next}\
+  /^NONBOND/{split($0,p,"|");split(p[2],q," - ");split(q[1],a," ");split(q[2],b," ");\
+   ka=a[1]" "a[2]" "a[3]" "a[4]" "(a[5]+0);kb=b[1]" "b[2]" "b[3]" "b[4]" "(b[5]+0);\
+   oa=((ka in occ)?occ[ka]:1);ob=((kb in occ)?occ[kb]:1);w=(oa<ob?oa:ob);\
+   print w,$2,($5>0?$4/$5:9)}\
+  END{print "TOTOCC",tot}' $pdbfile ${t}_filtgeo.txt >! ${t}_nbw.txt
+set nbNval = `awk -v mode=$nbN '$1=="TOTOCC"{tot=$2;next} $3<1.2{s12+=$1} $3<1.0{s10+=$1} END{n=tot;if(mode=="vdw120")n=s12;if(mode=="vdw100")n=s10;print n}' ${t}_nbw.txt`
+set nbN_int = `echo $nbNval | awk '{printf("%d",$1+0.5)}'`
+if( "$nbmode" == "occ" ) then
+  awk -v N=$nbNval '$1!="TOTOCC" && $2>0{s+=$1*$2} END{if(N>0)print s/N,N,"avg_nonbond"}' ${t}_nbw.txt >> ${t}_avgs_v2.txt
+endif
+awk '$NF=="clash"' ${t}_worsts.txt >! ${t}_worsts_v2.txt
+
+cat ${t}_avgs_v2.txt ${t}_worsts_v2.txt |\
 awk '{tag=$NF}\
    {$0=tolower($0);gsub("cbetadev","cbdev");gsub("torsion","tors");gsub("chiral","chir")}\
    {key=$NF;gsub("avg_","",key)}\
@@ -822,7 +909,7 @@ gnuplot >&! ${outprefix}_weights.txt
 
 # some kind of sanity check here?
 
-cat ${outprefix}_weights.txt ${t}_avgs.txt ${t}_worsts.txt |\
+cat ${outprefix}_weights.txt ${t}_avgs_v2.txt ${t}_worsts_v2.txt |\
 awk '$2~/[A-Z]/{weight[$NF]=$1;next}\
   {energy=$1+0}\
   energy<=0{energy=0}\
@@ -833,8 +920,73 @@ sort -gr |\
 cat >! ${t}_weighted.txt
 # w_energy tag
 
+# v2 nonbond, statistical form (nbmode stat/both): every contact is an item (N = all contacts, so extra bumps do not change N);
+# a repulsive contact's LJ (capped at 400) -> p = nbP0*exp(-nbk*LJ) -> two-sided Gaussian deviate z = -invnorm(p/2), energy z^2
+echo -n "" >! ${t}_nbstat.txt
+# nbmode=bonds (default): energy = LJ itself (one well depth ~ one z^2 unit: Boltzmann inversion of correct models 1.0-1.2,
+# quantile slope 1-1.5, 2*eps/kT ~ 1 for eps ~ 0.1 kcal/mol at 100 K), N = number of (non-H) bonds, i.e. fixed by the
+# covalent structure; plus an average term mean = sum(LJ>0)/N_bonds through the same chi-square weight as the other averages
+if( "$nbmode" == "bonds" ) then
+  awk '/^NONBOND/ && $2>0{++n;print "NONBOND",$2} END{for(i=n;i<'$nbonds';++i)print "NONBOND 0"}' ${t}_geo.txt >> ${t}_nbstat.txt
+else if( "$nbmode" == "occ" ) then
+  # outlier items: unweighted LJ by default (a clash is equally impossible in whichever conformer it occurs); nboutw=1: w*LJ
+  awk -v N=$nbN_int -v ow=$nboutw '$1!="TOTOCC" && $2>0{++n;print "NONBOND",(ow?$1*$2:$2)} END{for(i=n;i<N;++i)print "NONBOND 0"}' ${t}_nbw.txt >> ${t}_nbstat.txt
+else if( "$nbmode" != "physical" ) then
+  awk '/^NONBOND/ && $2<=0{print "NONBOND 0"}' ${t}_geo.txt >> ${t}_nbstat.txt
+  awk -v P0=$nbP0 -v k=$nbk '/^NONBOND/ && $2>0{E=($2>400?400:$2);\
+     print "print (-invnorm("P0"*exp(-"k"*"E")/2.0))**2, \" "$2"\""}' ${t}_geo.txt |\
+  gnuplot |&\
+  awk 'NF==2{print "NONBOND",$1+0}' >> ${t}_nbstat.txt
+endif
+
+# v2 revision 1: aggregate every outlier of each Gaussian-deviate category.
+# items: category energy (energy = z^2), all items of the category (N = their number)
+( awk '/^BOND|^ANGLE|^TORS|^CHIR|^PLANE/{print $1,$2}' ${t}_geo.txt ;\
+  awk '{print "OMEGA",$2}' ${t}_allomegas.txt ;\
+  awk '{print "RAMA",$2}'  ${t}_ramalyze.txt ;\
+  awk '{print "ROTA",$2}'  ${t}_rotalyze.txt ;\
+  awk '{print "CBDEV",$2}' ${t}_cbetadev.txt ;\
+  cat ${t}_nbstat.txt ) |\
+sort -k1,1 -k2gr >! ${t}_v2items_in.txt
+# each item i of a category of N items gets the weight the old score gave the worst one, Pnn(z_i, N): the probability that
+# a deviate this large among N is not noise (pnn=exact: erf(z/sqrt2)**N, default; pnn=soft: the old softPnna).
+# A noise-only category then pays about what the old worst term did; every further real outlier adds its own term.
+awk '{++N[$1]} END{for(c in N)print "N",c,N[c]}' ${t}_v2items_in.txt |\
+cat - ${t}_v2items_in.txt |\
+awk -v pnn=$pnn '$1=="N"{N[$2]=$3;next}\
+  {c=$1;E=$2+0;++k[c]} E<=0{next}\
+  {Ec=(E>400?400:E);f=(pnn=="exact"?"Pnn":"softPnna");\
+   print "print "f"("sqrt(Ec)","N[c]"),\" "c" "k[c]" "N[c]" "E"\""}' |\
+cat ${t}gnuplot.in - |\
+gnuplot >&! ${t}_v2pnn.txt
+# Pnn category k N energy -> weighted item: Pnn*softened energy
+awk 'NF==5{P=$1+0;if(P<1e-30)P=0;E=$5+0;e=E;if(e>10)e=10+log(e)-log(10);printf("%.6g %s %s %s %.6g %s\n",P*e,$2,$3,$4,P,E)}' ${t}_v2pnn.txt |\
+sort -gr >! ${outprefix}_v2items.txt
+# wE_item category k N Pnn energy
+
+# v2 revision 3: non-bonds as a physical energy: sum over contacts of the repulsive LJ energy, each softened above 10
+set nonbond_energy = `awk '/^NONBOND/ && $2>0{e=$2;if(e>10)e=10+log(e)-log(10);s+=e;++n} END{print s+0,n+0}' ${t}_geo.txt`
+
+# per-category breakdown
+( awk '{print "avgterm",$0}' ${t}_weighted.txt ;\
+  awk '{print "outlier",$0}' ${outprefix}_v2items.txt ;\
+  echo "nonbond $nonbond_energy" ) |\
+awk '$1=="avgterm" && $NF~/^avg_/{c=$NF;gsub("avg_","",c);c=toupper(c);if(c=="CHIRAL")c="CHIR";\
+       avg[c]+=$2;next}\
+  $1=="avgterm"{avg[toupper($NF)]+=$2;next}\
+  $1=="outlier"{c=$3;out[c]+=$2;if($2+0>0.01)++nout[c];N[c]=$5;next}\
+  $1=="nonbond"{nb=$2;nnb=$3}\
+  END{printf("%-8s %12s %8s %8s %10s\n","category","outliers","n>0.01","N","average");\
+    for(c in out)printf("%-8s %12.4f %8d %8d %10.4f\n",c,out[c],nout[c],N[c],avg[c]);\
+    for(c in avg)if(!(c in out))printf("%-8s %12s %8s %8s %10.4f\n",c,"-","-","-",avg[c]);\
+    printf("%-8s %12.4f %8d %8s %10s  (physical: sum of repulsive LJ, no weight; in wE only if nbmode physical/both)\n","NB_PHYS",nb,nnb,"contacts","-")}' |\
+cat >! ${outprefix}_v2terms.txt
+cat ${outprefix}_v2terms.txt
+
 # sum of all weighted deviates
-set energy = `awk '{sum+=$1} END{print sum}' ${t}_weighted.txt`
+set nbadd = 0
+if( "$nbmode" == "physical" || "$nbmode" == "both" ) set nbadd = $nonbond_energy[1]
+set energy = `cat ${t}_weighted.txt ${outprefix}_v2items.txt | awk -v nb=$nbadd '{sum+=$1} END{print sum+nb}'`
 echo "weighted energy (wE): $energy"
 
 

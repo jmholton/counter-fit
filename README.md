@@ -139,6 +139,17 @@ TYPE  energy  delta  obs  ideal  sigma | atom1 altid resname chain resi - atom2 
 Ideal values come from `phenix.geometry_minimization`, with CDL on unless
 `cdl=False` is given (ground_factory passes its own setting).
 
+This is molprobify v2 (22 Oct 2026), with this repository's changes to v1
+(`cdl=`, `cdl_interp=`, symmetry-mate contacts, `altecode`).  v2 changes
+only the weighted energy: every outlier of a category counts, each weighted
+by its probability of not being noise, erf(z/√2)^N (v1 counted the worst of
+each category only); a C-beta deviation is a 3D distance (a chi deviate
+with 3 degrees of freedom, sigma 0.032 Å); nonbond energy is per unit
+occupancy; Rama and rotamer energies are z².  The files fudgeify reads are
+the same as v1's, so only the logged wE changes.  The Challenge scorer
+(`~/Develop/molprobify_runme.com`) is v1, and runs before 16 Nov 2026
+logged v1 wE.
+
 Types: `NONBOND`, `BOND`, `ANGLE`, `TORSION`, `PLANE`.  A contact with a
 symmetry mate ends in `symop=<op>`: the `.geo` `sym.op.`, applied to the
 second atom.  Every restraint made from such a contact carries the operator
@@ -265,8 +276,8 @@ are skipped (exact atom match, either direction).
 
 **CB deviations.**  ground_factory turns phenix's `c_beta_restraints` off,
 so fudgeify restrains them itself, from `<prefix>_cbetadev.log` (passed as
-`cbetadev=`).  Each deviation is scored as (dev/0.05)², as molprobify scores
-it, and ranked with the fullgeo outliers; the worst `torsions` per cycle get
+`cbetadev=`).  Each deviation is scored as (dev/0.05)², as molprobify v1
+scores it, and ranked with the fullgeo outliers; the worst `torsions` per cycle get
 the pair of pseudo-dihedrals phenix would use (N–C–CA–CB and C–N–CA–CB, ideals
 from phenix `c_beta.py`, sigma 2.5), added as new restraints and tightened
 like the others.  The N/C–CA–CB torsions in fullgeo are skipped, since these
