@@ -61,6 +61,9 @@ ground_factory_runme.com  model.pdb  data.mtz  [options]
   backoff=0          if 1, smaller steps after an iteration that does not
                      beat the best wE so far (see Back-off below)
   backoff_max=4      most halvings (maxadd 3 → 1, crowbars 30 → 2, sigma/1.03)
+  scorer=molprobify  molprobify_runme.com, or wE_v2: wE_v2.py, the same
+                     score and files in a quarter of the time (needs
+                     fudgeify=1 and engine=phenix)
 ```
 
 **Outputs**
@@ -84,10 +87,11 @@ ground_factory_runme.com  model.pdb  data.mtz  [options]
 
 1. `phenix.refine` with `wxc_scale=0.1`
 2. `molprobify_runme.com` → weighted energy, fullgeo file, restraint
-   proposals (`refmac_opts_*.txt`, read by steps 3 and 4)
+   proposals (`refmac_opts_*.txt`, read by steps 3 and 4); with
+   `scorer=wE_v2`, `wE_v2.py` and then `fudgelists_runme.com`
 3. `redo_harmonics_runme.com` → update `phenix_holdme.eff`
 4. `reweight_opts_runme.com` → update `refmac_opts.txt`; writes `phenix_fudge.eff`
-   (overwritten by fudgeify when `fudgeify=1`)
+   (overwritten by fudgeify when `fudgeify=1`; skipped with `scorer=wE_v2`)
 5. `fudgeify.py` (if `fudgeify=1`) → update `fudge_table.txt`, overwrite `phenix_fudge.eff`
 6. 1 % sigma escalation on all entries in `refmac_opts.txt`
 
@@ -155,6 +159,38 @@ symmetry mate ends in `symop=<op>`: the `.geo` `sym.op.`, applied to the
 second atom.  Every restraint made from such a contact carries the operator
 (`symmetry_operation` for phenix, `symm y` for REFMAC, with the explicit
 operator in a trailing `! symop` comment).
+
+---
+
+### `wE_v2.py`
+
+A Python port of molprobify v2, run in-process under `phenix.python`:
+the same wE, and with `outprefix=P` the same `P_fullgeo.txt`,
+`P_clashes.txt` and `P_cbetadev.log` (byte-identical on 9 test models),
+in about a quarter of the time (1aho 8 s instead of 32 s, Mac1 15 s
+instead of 45 s).  It writes none of molprobify's `refmac_opts_*.txt`
+proposals; `fudgelists_runme.com` makes the ones the factory needs.
+
+```
+phenix.python wE_v2.py model.pdb  [cdl=True]  [cdl_interp=0]
+                       [overridefile=overrides.txt]  [outprefix=P]
+```
+
+---
+
+### `fudgelists_runme.com`
+
+```
+fudgelists_runme.com P  [sigma_fudge=3]
+```
+
+Rebuilds, from `P_fullgeo.txt`, `P_clashes.txt` and `P_cbetadev.log`, the
+outlier lists molprobify writes with `writefudge=1`
+(`refmac_opts_{declash,debump,fixbond,fixang,fixCBdev,fixtorsion}.txt`),
+with molprobify v2's own code, copied line for line.  `redo_harmonics`
+holds the atoms named in them, so `phenix_holdme.eff` comes out the same
+with either scorer.  `refmac_opts_fixplanes.txt` is left empty:
+redo_harmonics takes no atoms from plane lines.
 
 ---
 

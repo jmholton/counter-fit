@@ -66,6 +66,13 @@
 #                        iteration starts from the best model so far.  The final
 #                        REFMAC step starts from the best model.  Log: backoff.txt
 #     backoff_max=4      most halvings (maxadd 3 -> 1, crowbars 30 -> 2, sigma/1.03)
+#     scorer=molprobify  program that scores each model: molprobify (molprobify_runme.com
+#                        with writefudge=1), or wE_v2 (wE_v2.py in-process under
+#                        phenix.python: the same wE and fullgeo, clashes and cbetadev
+#                        files, faster).  wE_v2 writes no refmac fudge files, so
+#                        fudgelists_runme.com rebuilds the outlier lists redo_harmonics
+#                        needs, and reweight_opts is skipped (with fudgeify=1 and
+#                        engine=phenix, which wE_v2 requires, nothing reads its output)
 #
 #   Outputs:
 #     start_NNN.pdb    phenix-refined model each iteration
@@ -107,6 +114,7 @@ set refmac_weight = ""
 set lean          = 0
 set backoff       = 0
 set backoff_max   = 4
+set scorer        = molprobify
 
 foreach Arg ( $* )
   set key = `echo $Arg | awk -F= '{print $1}'`
@@ -143,6 +151,7 @@ foreach Arg ( $* )
   if("$key" == "lean")          set lean          = $val
   if("$key" == "backoff")       set backoff       = $val
   if("$key" == "backoff_max")   set backoff_max   = $val
+  if("$key" == "scorer")        set scorer        = $val
 end
 if("$crowbars" == "") set crowbars = $maxadd
 if("$bonds" == "")    set bonds    = $maxadd
@@ -198,6 +207,15 @@ endif
 
 if("$engine" != "phenix" && "$engine" != "refmac") then
   echo "ERROR: engine=$engine is neither phenix nor refmac"
+  exit 1
+endif
+if("$scorer" != "molprobify" && "$scorer" != "wE_v2") then
+  echo "ERROR: scorer=$scorer is neither molprobify nor wE_v2"
+  exit 1
+endif
+# without molprobify's fudge files only fudgeify can restrain the outliers
+if("$scorer" == "wE_v2" && ("$engine" != "phenix" || "$fudgeify" != "1")) then
+  echo "ERROR: scorer=wE_v2 needs engine=phenix and fudgeify=1"
   exit 1
 endif
 # refmac matches LABIN loosely (FP picked Fpart in a file holding both), so it gets an mtz with only its own columns
@@ -287,7 +305,13 @@ if(-s overrides.txt) set overridearg = "overridefile=overrides.txt"
 echo "=== Validating starting model ==="
 mkdir -p this start
 if(! -e start/refmac_opts_debump.txt) then
-  ${scriptdir}/molprobify_runme.com $pdbfile keepgeo=1 writefudge=1 cdl=${cdl} cdl_interp=${cdl_interp} $overridearg
+  if("$scorer" == "wE_v2") then
+    set startbase = `basename $pdbfile .pdb`
+    phenix.python ${scriptdir}/wE_v2.py $pdbfile cdl=${cdl} cdl_interp=${cdl_interp} $overridearg outprefix=$startbase
+    ${scriptdir}/fudgelists_runme.com $startbase
+  else
+    ${scriptdir}/molprobify_runme.com $pdbfile keepgeo=1 writefudge=1 cdl=${cdl} cdl_interp=${cdl_interp} $overridearg
+  endif
   cp refmac_opts_de*.txt refmac_opts_fix*.txt start/
 endif
 
@@ -442,12 +466,19 @@ EOF
   # Propagate: next iteration starts from this iteration's output
   if($propagate) set startpdb = ${prefix}_${num}.pdb
 
-  # writefudge=1 even with fudgeify: redo_harmonics and reweight_opts read
-  # its refmac_opts_*.txt proposals
-  set moltempfile = /dev/shm/${USER}/gf_${num}_
-  ${scriptdir}/molprobify_runme.com ${prefix}_${num}.pdb keepgeo=1 writefudge=1 debug=1 \
-    tempfile=${moltempfile} cdl=${cdl} cdl_interp=${cdl_interp} \
-    $overridearg | tee molprobify_${num}.log
+  if("$scorer" == "wE_v2") then
+    # same log name, so the energy is read the same way
+    phenix.python ${scriptdir}/wE_v2.py ${prefix}_${num}.pdb cdl=${cdl} cdl_interp=${cdl_interp} \
+      $overridearg outprefix=${prefix}_${num} | tee molprobify_${num}.log
+    ${scriptdir}/fudgelists_runme.com ${prefix}_${num}
+  else
+    # writefudge=1 even with fudgeify: redo_harmonics and reweight_opts read
+    # its refmac_opts_*.txt proposals
+    set moltempfile = /dev/shm/${USER}/gf_${num}_
+    ${scriptdir}/molprobify_runme.com ${prefix}_${num}.pdb keepgeo=1 writefudge=1 debug=1 \
+      tempfile=${moltempfile} cdl=${cdl} cdl_interp=${cdl_interp} \
+      $overridearg | tee molprobify_${num}.log
+  endif
 
   set energy = `grep -a "weighted energy" molprobify_${num}.log | tail -n 1 | awk '{print $NF}'`
   set isnum = `echo "$energy" | awk 'NF==1 && $1+0==$1{print 1;exit} {print 0}'`
@@ -479,8 +510,11 @@ EOF
   ${scriptdir}/redo_harmonics_runme.com startpdb=$startpdb prefix=$prefix
   cp refmac_opts_new.txt refmac_opts.txt
 
-  ${scriptdir}/reweight_opts_runme.com maxadd=$maxadd
-  cp refmac_opts_new.txt refmac_opts.txt
+  # its refmac restraints and phenix_fudge.eff are replaced by fudgeify's
+  if("$scorer" != "wE_v2") then
+    ${scriptdir}/reweight_opts_runme.com maxadd=$maxadd
+    cp refmac_opts_new.txt refmac_opts.txt
+  endif
 
   # Back-off: an iteration that beats the best so far takes back one halving,
   # any other adds one; with propagate the next starts from the best model
@@ -544,7 +578,11 @@ cp refmac_opts_beforefinal.txt refmac_opts.txt
 cp refmacout.pdb fmodelme.pdb
 
 echo "=== Final validation ==="
-${scriptdir}/molprobify_runme.com fmodelme.pdb keepgeo=1 cdl=${cdl} cdl_interp=${cdl_interp} $overridearg | tee molprobify_fmodelme.log
+if("$scorer" == "wE_v2") then
+  phenix.python ${scriptdir}/wE_v2.py fmodelme.pdb cdl=${cdl} cdl_interp=${cdl_interp} $overridearg outprefix=fmodelme | tee molprobify_fmodelme.log
+else
+  ${scriptdir}/molprobify_runme.com fmodelme.pdb keepgeo=1 cdl=${cdl} cdl_interp=${cdl_interp} $overridearg | tee molprobify_fmodelme.log
+endif
 
 # -----------------------------------------------------------------------
 # Step 6: Ideal structure factors
