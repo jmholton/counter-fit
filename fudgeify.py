@@ -7,7 +7,8 @@ correction restraints, accumulating sigma-tightening state in fudge_table.txt.
 
 Each call is one ground_factory cycle: the worst maxadd outliers of each type
 (or bonds=N, angles=N, torsions=N, planes=N, crowbars=N for one category)
-are added or tightened (sigma/1.5, down to the floors reweight_opts uses), and
+are added or tightened (sigma/1.5, or sigma/X with tighten=X, which
+ground_factory's backoff lowers; down to the floors reweight_opts uses), and
 every other entry is relaxed (sigma*1.01); NONBOND and BOND entries are
 dropped once relaxed to sigma 5.  A new BOND, ANGLE or TORSION entry changes
 phenix's own restraint, so it starts at natural sigma/1.5.  Every cycle, each
@@ -91,6 +92,8 @@ def parse_args():
     p.add_argument("--omegas",      type=int,   default=-1, help="omegas per cycle (default maxadd)")
     p.add_argument("--omega_esd",   type=float, default=0.0,
                    help="phenix's omega sigma in refinement, if overridden (ground_factory omega_esd)")
+    p.add_argument("--tighten",     type=float, default=1.5,
+                   help="sigma is divided by this when an entry is added or tightened (ground_factory backoff)")
     p.add_argument("--sigma_fudge", type=float, default=1.0)
     p.add_argument("--outfile",     default="phenix_fudge.eff")
     p.add_argument("--geo",         default="default.geo")
@@ -857,15 +860,16 @@ def refresh_ideals(entries, ideals):
             nchanged += 1
     return nchanged
 
-def tighten(fields, sig):
-    """sigma/1.5, not below the floor for its type, and never looser."""
-    return max(sig / 1.5, min(sig, FLOORS.get(fields[0], 0.001)))
+def tighten(fields, sig, factor=1.5):
+    """sigma/factor, not below the floor for its type, and never looser."""
+    return max(sig / factor, min(sig, FLOORS.get(fields[0], 0.001)))
 
-def accumulate(proposals, table_entries, maxadd, limits={}):
+def accumulate(proposals, table_entries, maxadd, limits={}, factor=1.5):
     """Tighten or add the worst proposals of each category: limits[category]
     of them, default maxadd.  The categories are the types, except that the
-    crowbar lists are CLASH and NONBOND and planes are PLANE.  Relax the rest
-    1%.  A crowbar tightened past its floor is lengthened instead.
+    crowbar lists are CLASH and NONBOND and planes are PLANE.  Tightening
+    divides sigma by factor.  Relax the rest 1%.  A crowbar tightened past
+    its floor is lengthened instead.
 
     Returns the new entries and how many were tightened, lengthened and added.
     """
@@ -890,10 +894,10 @@ def accumulate(proposals, table_entries, maxadd, limits={}):
         sig = float(fields[si])
         in_table.add(k)
         if k in chosen:
-            if t == "NONBOND" and sig / 1.5 < FLOORS[t]:
+            if t == "NONBOND" and sig / factor < FLOORS[t]:
                 fields[9] = f"{float(fields[9]) + CROWBAR_STEP:.4f}"
                 nlengthened += 1
-            sig = tighten(fields, sig)
+            sig = tighten(fields, sig, factor)
         else:
             # Relax; drop loose nonbond/bond/plane
             sig *= 1.01
@@ -914,7 +918,7 @@ def accumulate(proposals, table_entries, maxadd, limits={}):
             attrs = {a: v for a, v in attrs.items() if not a.startswith("_")}
             if not adds:
                 si = sigma_index(fields)
-                fields[si] = f"{tighten(fields, float(fields[si])):.6f}"
+                fields[si] = f"{tighten(fields, float(fields[si]), factor):.6f}"
             new_entries.append((fields, attrs))
             nadded += 1
 
@@ -1072,7 +1076,7 @@ def main():
     limits["CBDEV"] = 2 * limits.get("TORSION", args.maxadd)
     table = load_table(args.table)
     nrefreshed = refresh_ideals(table, load_ideals(args.fullgeo))
-    new_entries, ntightened, nlengthened, nadded = accumulate(proposals, table, args.maxadd, limits)
+    new_entries, ntightened, nlengthened, nadded = accumulate(proposals, table, args.maxadd, limits, args.tighten)
 
     write_table(new_entries, args.table)
     table_keys = set()
@@ -1089,7 +1093,7 @@ def main():
 
     ncrowbars = sum(1 for fields, attrs in new_entries if fields[0] == "NONBOND")
     print(f"fudgeify: wrote {args.outfile} from {args.fullgeo} ({len(new_entries)} table entries,"
-          f" {nadded} added, {ntightened} tightened, {nlengthened} crowbars lengthened,"
+          f" {nadded} added, {ntightened} tightened (sigma/{args.tighten:g}), {nlengthened} crowbars lengthened,"
           f" {nrefreshed} ideals updated, {len(targets)} scorer targets)")
     worst = ""
     if close:

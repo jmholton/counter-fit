@@ -57,6 +57,15 @@
 #                        automatic weight in its first iteration, times wxc)
 #     lean=0             if 1, phenix skips the maps, mtz, cif and def files of each
 #                        iteration (nothing reads them; ~13 s less per iteration)
+#     backoff=0          if 1, the step follows progress: after an iteration that
+#                        does not beat the best wE so far, the restraints added or
+#                        tightened per cycle (maxadd, crowbars, bonds, ...) are
+#                        halved again and fudgeify's tightening (sigma/1.5) shrinks
+#                        to sigma/(1+0.5/2^n) for n halvings; after one that does,
+#                        one halving is taken back.  With propagate=1 the next
+#                        iteration starts from the best model so far.  The final
+#                        REFMAC step starts from the best model.  Log: backoff.txt
+#     backoff_max=4      most halvings (maxadd 3 -> 1, crowbars 30 -> 2, sigma/1.03)
 #
 #   Outputs:
 #     start_NNN.pdb    phenix-refined model each iteration
@@ -96,6 +105,8 @@ set engine        = phenix
 set labin         = "FP=FP SIGFP=SIGFP FREE=FreeR_flag"
 set refmac_weight = ""
 set lean          = 0
+set backoff       = 0
+set backoff_max   = 4
 
 foreach Arg ( $* )
   set key = `echo $Arg | awk -F= '{print $1}'`
@@ -130,6 +141,8 @@ foreach Arg ( $* )
   if("$key" == "labin")         set labin         = `echo $Arg | cut -d= -f2- | tr ',' ' '`
   if("$key" == "refmac_weight") set refmac_weight = $val
   if("$key" == "lean")          set lean          = $val
+  if("$key" == "backoff")       set backoff       = $val
+  if("$key" == "backoff_max")   set backoff_max   = $val
 end
 if("$crowbars" == "") set crowbars = $maxadd
 if("$bonds" == "")    set bonds    = $maxadd
@@ -333,6 +346,25 @@ set prev_energy = `awk '$2+0==$2 && $3==""{e=$2} END{print e+0}' itr_vs_energy.t
 if("$prev_energy" == "0") set prev_energy = 9999
 set pre_snap_startpdb = $startpdb
 
+# Back-off state: the best wE and model so far and the number of halvings,
+# resumed from itr_vs_energy.txt and backoff.txt
+set best_energy = 9999
+set best_pdb    = ""
+set level       = 0
+if($backoff) then
+  set _best = ( `awk '$2+0==$2 && $3!="snap_reverted"{if(b=="" || $2+0<e){b=$1; e=$2+0}} END{if(b!="") print b, e}' itr_vs_energy.txt` )
+  if($#_best == 2) then
+    if(-e ${prefix}_$_best[1].pdb) then
+      set best_pdb    = ${prefix}_$_best[1].pdb
+      set best_energy = $_best[2]
+    endif
+  endif
+  if(-s backoff.txt) then
+    set level = `tail -n 1 backoff.txt | awk '{print $4+0}'`
+  endif
+  if($propagate && "$best_pdb" != "") set startpdb = $best_pdb
+endif
+
 foreach x ( `seq 1 $maxcycles` )
 
   set num = `echo $num | awk '{printf("%03d",$1+1)}'`
@@ -450,10 +482,27 @@ EOF
   ${scriptdir}/reweight_opts_runme.com maxadd=$maxadd
   cp refmac_opts_new.txt refmac_opts.txt
 
+  # Back-off: an iteration that beats the best so far takes back one halving,
+  # any other adds one; with propagate the next starts from the best model
+  set fudgeargs = "maxadd=$maxadd crowbars=$crowbars bonds=$bonds angles=$angles torsions=$torsions planes=$planes omegas=$omegas"
+  if($backoff) then
+    set better = `echo $energy $best_energy | awk '{print ($1+0 < $2+0)}'`
+    if($better) then
+      set best_energy = $energy
+      set best_pdb    = ${prefix}_${num}.pdb
+      set level = `echo $level | awk '{print ($1>0 ? $1-1 : 0)}'`
+    else
+      set level = `echo $level $backoff_max | awk '{print ($1<$2 ? $1+1 : $2)}'`
+    endif
+    if($propagate) set startpdb = $best_pdb
+    set fudgeargs = `echo $level $maxadd $crowbars $bonds $angles $torsions $planes $omegas | awk '{f=2^$1; split("maxadd crowbars bonds angles torsions planes omegas",k," "); for(i=2;i<=NF;i++){n=$i; if(n>0){n=int(n/f+0.5); if(n<1)n=1}; printf "%s=%d ", k[i-1], n}; printf "tighten=%g\n", 1+0.5/f}'`
+    echo "$num $energy $best_energy $level $fudgeargs" >> backoff.txt
+    echo "back-off: level $level, next iteration from $startpdb, $fudgeargs"
+  endif
+
   if($fudgeify && "$engine" == "phenix") then
     python3 ${scriptdir}/fudgeify.py ${prefix}_${num}_fullgeo.txt \
-      maxadd=$maxadd crowbars=$crowbars bonds=$bonds angles=$angles \
-      torsions=$torsions planes=$planes omegas=$omegas $omegafudge outfile=phenix_fudge.eff $overridearg \
+      $fudgeargs $omegafudge outfile=phenix_fudge.eff $overridearg \
       cbetadev=${prefix}_${num}_cbetadev.log
     if($status) then
       echo "ERROR: fudgeify.py failed at iteration $num — stopping"
@@ -472,6 +521,7 @@ end
 # Step 5: Final B-factor convergence with REFMAC
 # -----------------------------------------------------------------------
 set lastpdb = `ls -1rt ${prefix}_???.pdb | tail -n 1`
+if($backoff && "$best_pdb" != "") set lastpdb = $best_pdb
 echo "=== Final REFMAC B-factor convergence from $lastpdb ==="
 
 cat << EOF >! refmac_opts_final.txt

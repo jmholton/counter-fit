@@ -12,7 +12,9 @@ Repeat until the weighted energy score converges (target wE < 9).
 Every cycle refines the same starting model, and sigmas change gradually
 (÷1.5 for the worst outliers, ×1.01 for everything else), because the system
 is prone to instability.  Changes are never undone: if wE goes up, something
-else needs more restraint, and the next cycle gives it that.
+else needs more restraint, and the next cycle gives it that.  With
+`backoff=1` the steps get smaller instead while wE is not improving
+(Back-off, below).
 
 ---
 
@@ -56,6 +58,9 @@ ground_factory_runme.com  model.pdb  data.mtz  [options]
                      molprobify scores at 4.01)
   overrides=file     TORSION OVERRIDE file — genuine outliers that must not
                      be tightened (see OVERRIDE policy below)
+  backoff=0          if 1, smaller steps after an iteration that does not
+                     beat the best wE so far (see Back-off below)
+  backoff_max=4      most halvings (maxadd 3 → 1, crowbars 30 → 2, sigma/1.03)
 ```
 
 **Outputs**
@@ -71,6 +76,7 @@ ground_factory_runme.com  model.pdb  data.mtz  [options]
 | `start_NNN_crowbars.txt` | contacts each crowbar switches off or weakens in phenix |
 | `ground_factory.lock` | host and PID of the run using this directory |
 | `fixed_weights.txt` | wxc and wxu from iteration 001, unscaled |
+| `backoff.txt` | with `backoff=1`: iteration, wE, best wE, level, fudgeify's arguments |
 | `fmodelme.pdb` | final model after REFMAC B-factor convergence |
 | `nonoise.mtz` / `simplenoise.mtz` | ideal / ~3%-noisy structure factors, at the resolution of the input mtz |
 
@@ -86,7 +92,8 @@ ground_factory_runme.com  model.pdb  data.mtz  [options]
 6. 1 % sigma escalation on all entries in `refmac_opts.txt`
 
 The loop stops at `maxcycles`, or when phenix, molprobify or fudgeify fails.
-The final REFMAC step starts from the last iteration.
+The final REFMAC step starts from the last iteration (with `backoff=1`, from
+the best).
 
 **X-ray weights.**  phenix normally recomputes its X-ray weights (wxc, wxu)
 every macro-cycle from gradient norms, and a new or tightened restraint can
@@ -98,6 +105,18 @@ and every later iteration passes `fix_wxc = wxc × wxc_scale` (phenix ignores
 `wxu_scale`).  phenix's default target is least-squares for the first two
 macro-cycles and ml after, with weights ~10× apart, so every iteration uses
 `main.target=ml`.
+
+**Back-off.**  The number of restraints added or tightened per cycle is
+otherwise fixed, however small the outliers have become, and an entry that is
+not picked relaxes only 1 % per cycle.  With `backoff=1` the step follows
+progress: after each iteration is scored, one that beats the best wE so far
+takes back one halving (level − 1, not below 0), any other adds one (level
++ 1, up to `backoff_max`).  At level n every count (maxadd, crowbars, bonds,
+angles, torsions, planes, omegas) is divided by 2^n and rounded, at least 1,
+and fudgeify divides sigma by 1 + 0.5/2^n instead of 1.5 (`tighten=`).  With
+`propagate=1` the next iteration starts from the best model so far.  A
+restart resumes the level and the best model from `backoff.txt` and
+`itr_vs_energy.txt`.
 
 ---
 
@@ -177,7 +196,7 @@ cycle:
 | Event | Action |
 |-------|--------|
 | One of the worst `maxadd` outliers of its type, not yet in the table | Add: a crowbar at sigma 0.4; a plane at phenix's sigma (it is a second restraint); BOND/ANGLE/TORSION at natural sigma/1.5 (they change phenix's own restraint, so natural sigma would change nothing) |
-| One of the worst `maxadd` outliers of its type, already in the table | Tighten: `sigma /= 1.5`, down to the floors (crowbar 0.01, BOND 0.001, ANGLE and TORSION 0.01) |
+| One of the worst `maxadd` outliers of its type, already in the table | Tighten: `sigma /= 1.5` (`tighten=X`: X), down to the floors (crowbar 0.01, BOND 0.001, ANGLE and TORSION 0.01) |
 | A crowbar chosen again at its floor | Lengthen: `dmin += 0.1` |
 | Anything else in the table | Relax: `sigma *= 1.01` |
 | NONBOND, BOND or PLANE sigma ≥ 5 | Drop (restraint resolved) |
@@ -269,7 +288,7 @@ python3 fudgeify.py  start_006_fullgeo.txt  [maxadd=1]  [crowbars=1]  [outfile=p
                      [table=fudge_table.txt]  [overridefile=overrides.txt]
                      [clashes=start_006_clashes.txt]  [watch=start_006_crowbars.txt]
                      [pdb=start_006.pdb]  [geo=default.geo]
-                     [cbetadev=start_006_cbetadev.log]
+                     [cbetadev=start_006_cbetadev.log]  [tighten=1.5]
 ```
 
 Key-value arguments (`key=val`) are accepted alongside normal flags.
