@@ -504,8 +504,8 @@ awk '{$1+=0;print "ROTA",$0}' |\
 sort -k2gr >! ${t}_rotalyze.txt
 # ROTA energy resnum%64  otherstuff  1-probOK
 cat ${outprefix}_ramalyze.log  |\
- awk -F ":" '! /^SUMM|^resid/ && /^ A/{\
-   n=(substr($0,3,4)-1)%64+1;\
+ awk -v modulo=$modulo -F ":" '! /^SUMM|^resid/ && /^[ A-Za-z0-9][ A-Za-z0-9] *-?[0-9]/{\
+   n=(substr($0,3,4)-1)%modulo+1;\
    P=1-$2/100;\
    pP=sprintf("%.35g",P-1e-16);\
    arg="2*inverf("pP")**2";\
